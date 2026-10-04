@@ -1,26 +1,66 @@
 # DarwinForge
 
-Turn a small iOS project written in C, Objective-C, C++ or Swift into an
-installable `.ipa` — **on Linux, with no Mac and no remote build host**.
+**Build an installable iOS `.ipa` from C, Objective-C, C++ or Swift — on Linux, on
+Windows, on WSL. No Mac. No Xcode. No remote build host. No Apple developer
+account.**
 
-`darwinforge` is a proof of concept. It orchestrates tools that already exist
-(`clang`, `ld64.lld`, `ldid`) instead of reimplementing them.
+[![CI](https://github.com/20obb/darwinforge/actions/workflows/ci.yml/badge.svg)](https://github.com/20obb/darwinforge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](Cargo.toml)
+
+**[github.com/20obb/darwinforge](https://github.com/20obb/darwinforge)**
+
+---
+
+## Why this exists
+
+Building an iOS app normally means owning a Mac. Xcode, a provisioning profile,
+a developer account, and a Mac-shaped workflow for what is fundamentally a
+compile-and-link job. That is a hard requirement for *shipping* to the App Store,
+and a completely unnecessary one for the far more common case: producing a
+runnable `.ipa` for your own device, a jailbroken phone, AltStore, Sideloadly or
+an automated test rig.
+
+DarwinForge closes that gap. It runs the real Apple toolchain — `clang`,
+`ld64.lld`, `ldid` — against a real iPhoneOS SDK, on whatever machine you already
+have:
 
 ```
-config -> discovery -> compile -> link -> bundle -> sign -> package
+config → discovery → compile → link → bundle → sign → package
 ```
+
+It orchestrates tools that already exist rather than reimplementing them. It
+does **not** replace Xcode, and it will tell you so: no storyboards, no asset
+catalogues, no `.xcodeproj`, and an ad-hoc rather than a certificate-backed
+signature. See [LIMITATIONS.md](LIMITATIONS.md) for the full list.
+
+## What makes it different
+
+| | |
+| --- | --- |
+| **Zero dependencies** | Not one external Rust crate. `cargo build` never touches the network, and the binary has nothing to audit but this repository. |
+| **Self-configuring** | `darwinforge bootstrap` detects your distribution, finds the newest toolchain, installs what is missing and fetches an SDK — or tells you precisely why it cannot. |
+| **Never hangs** | With no TTY and no `--yes`, every prompt becomes an actionable error instead of a stall. Safe in CI. |
+| **Honest** | It reports what it did *not* verify, and a dry run never claims success for work it did not do. |
 
 ## Quick start
 
 ```sh
-darwinforge bootstrap        # prepare this machine
-darwinforge init MyApp
-cd MyApp && darwinforge build --sdk <path-to-iPhoneOS*.sdk>
+git clone https://github.com/20obb/darwinforge.git
+cd darwinforge
+cargo build --release
+./target/release/darwinforge bootstrap     # prepare this machine
+./target/release/darwinforge init MyApp
+cd MyApp && ../target/release/darwinforge build
 ```
 
-`bootstrap` is the headline command: it detects your distribution, works out
-which toolchain packages are missing, prepares the SDK, and tells you whether
-this machine can build. See [`darwinforge bootstrap`](#darwinforge-bootstrap).
+`bootstrap` is the headline command: it detects your distribution, resolves and
+installs the toolchain, fetches an iPhoneOS SDK, and reports whether this
+machine can build. See [`darwinforge bootstrap`](#darwinforge-bootstrap).
+
+Already installed a release build? `./install.sh` or `.\install.ps1` puts it on
+your `PATH` without root, then offers to bootstrap.
 
 ---
 
@@ -30,7 +70,7 @@ Requires a stable Rust toolchain (1.70+). The crate has **zero external
 dependencies**, so `cargo build` never touches the network.
 
 ```sh
-git clone <this repo> && cd darwinforge
+git clone https://github.com/20obb/darwinforge.git && cd darwinforge
 cargo build --release
 ./target/release/darwinforge --help
 ```
@@ -612,8 +652,46 @@ stable:**
 * The CI workflow itself (`.github/workflows/ci.yml`, `release.yml`) has not
   been observed running; no build of this tree has been published.
 
+## Contributing
+
+The zero-dependency rule is the defining constraint of this project, so please
+keep it: **do not add a crate to `Cargo.toml`.** Everything you need is in `std`,
+and if something seems to need a crate, it usually needs a small function
+instead.
+
+Before opening a pull request:
+
+```sh
+cargo test                                    # 270 tests
+cargo clippy --all-targets -- -D warnings     # must be silent
+```
+
+Please also read **[LIMITATIONS.md](LIMITATIONS.md)** first. It records what has
+and has not been verified, and a change that alters behaviour should update it —
+in both directions. If you extend a code path that has never run on a real
+machine, say so there rather than letting the docs imply coverage that is not
+there.
+
+## Project layout
+
+```
+src/            the crate: one module per pipeline stage or subsystem
+templates/      main.m, embedded into `darwinforge init` at compile time
+samples/        a complete Objective-C UIKit app
+demo/           stub toolchain + an independent .ipa verifier, for machines
+                that have no Apple SDK
+tests/          end-to-end tests against the stub toolchain
+packaging/      .deb, .rpm and Arch packaging
+scripts/        install + release drivers (no make required)
+.github/        ci.yml (test on Linux + Windows) and release.yml (tag a v*)
+```
+
 ## License
 
-MIT. Apple, iPhone, iOS and `.ipa` are trademarks of Apple Inc. This project is
-unaffiliated with Apple. You are responsible for complying with Apple's licence
-terms for the SDK you supply.
+MIT — see [LICENSE](LICENSE).
+
+Apple, iPhone, iOS and `.ipa` are trademarks of Apple Inc. This project is
+unaffiliated with Apple. The iPhoneOS SDK is Apple's software and is **not
+included, downloaded or redistributed** by this project; `bootstrap` fetches it
+from a third-party repository at your request, and you are responsible for
+complying with Apple's licence terms for it.

@@ -1,0 +1,3 @@
+/* Localizable.strings — copied verbatim into the .app, no compilation needed. */
+"greeting.title" = "Hello from darwinforge";
+"greeting.subtitle" = "Built on Linux, no Mac required.";

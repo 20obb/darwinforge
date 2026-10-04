@@ -1,0 +1,23 @@
+[package]
+name = "darwinforge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Build an installable iOS .ipa from C/ObjC/C++/Swift sources on Linux, without a Mac"
+license = "MIT"
+publish = false
+
+[lib]
+name = "darwinforge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "darwinforge"
+path = "src/main.rs"
+
+# The PoC has zero external dependencies on purpose: no `serde`/`toml`/`zip`
+# crates, so nothing here can reach the network at build time.
+[dependencies]
+
+[profile.release]
+opt-level = 2

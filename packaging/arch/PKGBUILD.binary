@@ -1,0 +1,63 @@
+# Maintainer: DarwinForge contributors <darwinforge@example.invalid>
+
+# SC2034/SC2154: pkgname/pkgver/pkgrel/pkgdesc/arch/... look unused or
+# unassigned to shellcheck, but they are not shell variables: makepkg sources
+# this file, defines srcdir/pkgdir/builddir, and reads the pkg* keys itself.
+# shellcheck disable=SC2034,SC2154
+
+# PKGBUILD.binary -- installs the PREBUILT statically linked darwinforge binary
+# instead of compiling it.
+#
+# Use this when you do not want to build Rust from source (it still needs the
+# Rust toolchain to be installed, but no compilation happens). The trade-off is
+# that the binary is only as trustworthy as the release tarball: there is no
+# build-from-source verification.
+#
+# PKGBUILD, next to this file, is the source-building variant and is the one
+# you should prefer for anything long-lived.
+
+pkgname=darwinforge
+pkgver=0.0.0
+pkgrel=1
+pkgdesc='Build an installable iOS .ipa on Linux, without a Mac'
+arch=('x86_64')
+url='https://github.com/darwinforge/darwinforge'
+license=('MIT')
+
+# git is required; clang/lld/zip are optional toolchain pieces darwinforge
+# shells out to.
+depends=('git')
+optdepends=('clang: compile C/ObjC/C++ sources to Mach-O objects'
+            'lld: ld64.lld, the Mach-O linker'
+            'zip: only needed when darwinforge.toml sets build.use_external_zip')
+
+# A single static musl binary for x86_64: nothing to compile, nothing to link.
+source=("darwinforge-$pkgver-x86_64-unknown-linux-musl.tar.gz")
+sha256sums=('SKIP')
+
+pkgver() {
+    # There is no Cargo.toml in the binary tarball, so ask the binary itself.
+    # `darwinforge --version` prints "DarwinForge <version>".
+    if [ -x "$srcdir/darwinforge" ]; then
+        local reported
+        reported=$("$srcdir/darwinforge" --version 2>/dev/null | awk '{print $NF}')
+        # Only accept it if it looks like a version; otherwise keep pkgver.
+        case ${reported:-} in
+            [0-9]*.[0-9]*) printf '%s' "$reported"; return 0 ;;
+        esac
+    fi
+    printf '%s' "$pkgver"
+}
+
+package() {
+    install -Dm0755 "$srcdir/darwinforge" "$pkgdir/usr/bin/darwinforge"
+
+    # The tarball carries the docs alongside the binary.
+    for doc in README.md LIMITATIONS.md LICENSE; do
+        if [ -f "$srcdir/$doc" ]; then
+            install -Dm0644 "$srcdir/$doc" "$pkgdir/usr/share/doc/$pkgname/$doc"
+        fi
+    done
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm0644 "$srcdir/install.sh" "$pkgdir/usr/share/doc/$pkgname/install.sh"
+}

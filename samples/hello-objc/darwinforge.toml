@@ -1,0 +1,18 @@
+# DarwinForge project configuration.
+#
+# This is the sample project. `darwinforge init Hello` produces the same layout.
+
+[app]
+# Becomes the .app directory name and CFBundleExecutable.
+name = "Hello"
+bundle_id = "com.example.hello"
+min_ios_version = "13.0"
+version = "1.0"
+build = "1"
+device_family = [1, 2]
+
+[build]
+sources = ["Sources/**/*.m", "Sources/**/*.c", "Sources/**/*.mm", "Sources/**/*.cpp"]
+resources = ["Resources/**/*"]
+frameworks = ["UIKit", "Foundation"]
+cflags = ["-fobjc-arc"]

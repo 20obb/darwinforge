@@ -1,0 +1,68 @@
+# Maintainer: DarwinForge contributors <darwinforge@example.invalid>
+
+# SC2034/SC2154: pkgname/pkgver/pkgrel/pkgdesc/arch/... look unused or
+# unassigned to shellcheck, but they are not shell variables: makepkg sources
+# this file, defines srcdir/pkgdir/builddir, and reads the pkg* keys itself.
+# shellcheck disable=SC2034,SC2154
+
+pkgname=darwinforge
+pkgver=0.0.0
+pkgrel=1
+pkgdesc='Build an installable iOS .ipa on Linux, without a Mac'
+arch=('x86_64' 'aarch64')
+url='https://github.com/darwinforge/darwinforge'
+license=('MIT')
+
+# git is required (projects are usually cloned); clang/lld/zip are what
+# darwinforge shells out to, so they are optdepends rather than depends.
+depends=('git')
+optdepends=('clang: compile C/ObjC/C++ sources to Mach-O objects'
+            'lld: ld64.lld, the Mach-O linker'
+            'zip: only needed when darwinforge.toml sets build.use_external_zip')
+makedepends=('rust' 'cargo')
+
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+# cd into the crate root. The `|| return` matters: a PKGBUILD runs without
+# `set -e`, so a failed cd would otherwise silently build the wrong directory.
+_srcdir_name() {
+    # The release tarball unpacks to a directory whose name embeds the version;
+    # find it rather than hardcoding, so a version bump cannot break the build.
+    local dir
+    dir=$(find "$srcdir" -maxdepth 1 -type d -name 'darwinforge-*' -print -quit)
+    [ -n "$dir" ] || return 1
+    printf '%s' "$dir"
+}
+
+# The version is the single source of truth in Cargo.toml. pkgver() reads it
+# from the unpacked source so `makepkg` cannot record a version that disagrees
+# with the code it is about to package.
+pkgver() {
+    local manifest
+    manifest=$(find "$srcdir" -maxdepth 2 -name Cargo.toml -print -quit)
+    [ -n "$manifest" ] || return 1
+    sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -n 1
+}
+
+build() {
+    cd "$(_srcdir_name)" || return 1
+    # The PoC has zero dependencies, so --offline/--locked always work and the
+    # build never touches the network.
+    CARGO_NET_OFFLINE=true cargo build --release --offline --locked
+}
+
+check() {
+    cd "$(_srcdir_name)" || return 1
+    CARGO_NET_OFFLINE=true cargo test --offline --locked
+}
+
+package() {
+    cd "$(_srcdir_name)" || return 1
+
+    install -Dm0755 target/release/darwinforge "$pkgdir/usr/bin/darwinforge"
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm0644 LIMITATIONS.md "$pkgdir/usr/share/doc/$pkgname/LIMITATIONS.md"
+    install -Dm0644 scripts/install.sh "$pkgdir/usr/share/doc/$pkgname/install.sh"
+}

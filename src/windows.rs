@@ -115,10 +115,153 @@ pub fn no_native_ldid_step() -> Step {
     )
 }
 
+/// The WSL distros `wsl --list --quiet` reports.
+///
+/// `wsl -l -q` prints UTF-16LE on Windows and carries a NUL after every entry,
+/// so the bytes are decoded explicitly rather than read as UTF-8. An empty
+/// list means WSL is not installed or has no distribution — which is itself
+/// the answer the caller needs, so it is not an error.
+pub fn parse_wsl_distros(bytes: &[u8]) -> Vec<String> {
+    // `wsl -l -q` emits UTF-16LE: two bytes per character, low byte first,
+    // with a NUL *code unit* between entries. Reading it as UTF-8 would turn
+    // every name into replacement characters, and the names are the whole point
+    // — the message tells the user which distro to build inside.
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    // An odd trailing byte cannot form a code unit; dropping it is correct, and
+    // the `is_empty` check below turns an undecodable input into "no distros",
+    // which is the safe reading (recommend installing WSL, not name a wrong one).
+    let text = String::from_utf16_lossy(&units);
+    text.split('\0')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Ask Windows which WSL distributions are installed.
+///
+/// Returns an empty list when `wsl` is absent, when WSL is not installed, or
+/// when the command fails for any reason — every one of which means "no WSL to
+/// bridge to", and none of which is worth failing the run over.
+pub fn wsl_distros() -> Vec<String> {
+    let output = std::process::Command::new("wsl")
+        .args(["--list", "--quiet"])
+        .output();
+    match output {
+        Ok(output) => parse_wsl_distros(&output.stdout),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The step shown when Windows has no native ldid.
+///
+/// The reported bug: on a Windows machine without ldid, the only advice was
+/// "no package for ldid on winget", which is true and useless — there is no
+/// official Windows build, so no package will ever appear. When WSL *is*
+/// installed the step must therefore recommend the bridge and name the
+/// distribution, because that is a route that actually works.
+pub fn ldid_on_windows(distros: &[String]) -> Step {
+    let detail = if distros.is_empty() {
+        // No WSL either, so the answer is to install it — not to hunt a package.
+        format!(
+            "ldid has no official Windows build, so no package manager will ever provide it, \
+             and this machine has no WSL distribution to bridge to. {WSL_INSTALL_AFTER_REBOOT}"
+        )
+    } else {
+        format!(
+            "ldid has no official Windows build, so no package manager will ever provide it. \
+             WSL is installed ({}) and has ldid available: run the build inside WSL, where \
+             the toolchain and the SDK's symlinks both work. From PowerShell:\n\
+             \n    darwinforge build <path-to-project>\n\
+             \n  darwinforge detects this automatically and re-runs the pipeline in WSL.",
+            distros.join(", ")
+        )
+    };
+    Step::check("ldid", "sign the app").with_outcome(Status::Failed, detail)
+}
+
 /// The step offering to enable WSL.
 pub fn offer_wsl_install_step() -> Step {
     Step::check("wsl", "enable the Windows Subsystem for Linux")
         .with_outcome(Status::Skipped, WSL_INSTALL_AFTER_REBOOT.to_string())
+}
+
+#[cfg(test)]
+mod wsl_tests {
+    use super::*;
+
+    /// Encode `text` the way `wsl --list --quiet` does: UTF-16LE, one code unit
+    /// per character, NUL-terminated.
+    fn utf16le(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn the_wsl_listing_is_decoded_from_utf16_not_utf8() {
+        // `wsl -l -q` is UTF-16LE. Read as UTF-8 it would produce replacement
+        // characters, and the message would name a distro that does not exist.
+        let bytes = utf16le("Ubuntu\0");
+        assert_eq!(parse_wsl_distros(&bytes), ["Ubuntu"]);
+        let two = utf16le("Ubuntu\0Debian\0");
+        assert_eq!(parse_wsl_distros(&two), ["Ubuntu", "Debian"]);
+    }
+
+    #[test]
+    fn an_empty_or_unusable_wsl_listing_means_no_distros() {
+        // Every one of these means "there is nothing to bridge to", which is the
+        // answer that must lead to recommending `wsl --install`.
+        assert!(parse_wsl_distros(b"").is_empty(), "no output");
+        assert!(parse_wsl_distros(&utf16le("\0")).is_empty(), "a bare terminator");
+        assert!(parse_wsl_distros(&utf16le("\0\0")).is_empty(), "several terminators");
+        assert!(parse_wsl_distros(&[0xFF]).is_empty(), "an odd trailing byte");
+    }
+
+    #[test]
+    fn a_missing_ldid_recommends_the_bridge_when_wsl_exists() {
+        // The reported bug: on Windows without ldid, the only advice was "no
+        // package for ldid on winget" — true, and a dead end, because no
+        // official Windows build of ldid exists. When WSL is installed the step
+        // must recommend the bridge and name the distro.
+        let step = ldid_on_windows(&["Ubuntu".to_string(), "Debian".to_string()]);
+        let detail = step.detail.expect("must explain");
+        assert_eq!(step.name, "ldid");
+        assert_eq!(step.status, Status::Failed, "still a failure: no signer, no build");
+        assert!(detail.contains("Ubuntu") && detail.contains("Debian"), "names the distros: {detail}");
+        assert!(detail.contains("WSL"), "says what to use: {detail}");
+        assert!(
+            !detail.contains("no package for ldid on winget"),
+            "a package hunt is the dead end it must replace: {detail}"
+        );
+        // And it must not pretend the machine can build natively.
+        assert!(!can_build_natively(false), "no signer means no native build");
+    }
+
+    #[test]
+    fn a_missing_ldid_without_wsl_recommends_installing_wsl_not_a_package() {
+        let step = ldid_on_windows(&[]);
+        let detail = step.detail.expect("must explain");
+        assert!(detail.contains("no official Windows build"), "{detail}");
+        assert!(detail.contains("wsl --install"), "offers the route that works: {detail}");
+        assert!(
+            !detail.contains("no package for ldid"),
+            "and never suggests hunting for a package that cannot exist: {detail}"
+        );
+    }
+
+    #[test]
+    fn the_mode_is_chosen_from_what_is_present() {
+        assert_eq!(choose_mode(true, false), Mode::Native, "a real signer means native works");
+        assert_eq!(choose_mode(true, true), Mode::Native, "and native is still preferred");
+        assert_eq!(
+            choose_mode(false, true),
+            Mode::WslBridge,
+            "no signer but WSL: bridge, the only mode that can finish"
+        );
+        assert_eq!(choose_mode(false, false), Mode::Native, "neither: name the missing pieces");
+    }
 }
 
 /// True when `content` looks like a symlink written out as a text file.

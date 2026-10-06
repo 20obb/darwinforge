@@ -1,24 +1,41 @@
 //! Hand-rolled argument parsing. Kept dependency-free and small; unknown flags
 //! are errors, so a typo never silently changes what gets built.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
 pub const USAGE: &str = r#"DarwinForge — build an installable iOS .ipa on Linux, without a Mac
 
+EXAMPLES:
+    darwinforge bootstrap
+    darwinforge init MyApp
+    darwinforge build MyApp
+    darwinforge sdk
+    darwinforge clean MyApp
+    darwinforge doctor --fix
+    darwinforge completions bash
+
 USAGE:
     darwinforge bootstrap [--yes] [--no-install] [--sdk-version V|latest] [--dry-run]
-    darwinforge doctor [--sdk PATH] [-v]
+    darwinforge doctor [--sdk PATH] [--fix] [--yes] [-v]
     darwinforge init <name> [--bundle-id ID] [--dir PATH] [--force]
-    darwinforge build [--sdk PATH] [--arch ARCH] [--project PATH] [-o FILE] [-v]
+    darwinforge init --here [--bundle-id ID] [--dir PATH] [--force]
+    darwinforge build [PATH] [--sdk PATH] [--arch ARCH] [--project PATH] [-o FILE] [-v]
+    darwinforge sdk [list [FILTER] | install [VERSION] | use TARGET | remove VERSION | path]
+    darwinforge clean [PATH] [--dry-run]
+    darwinforge completions <bash|zsh|fish|powershell>
 
 COMMANDS:
     bootstrap    Prepare this machine: detect the OS, install the toolchain,
                  install an iPhoneOS SDK and smoke-test the result. Idempotent.
-    doctor      Check for clang, a Mach-O linker, ldid, zip and the SDK path.
-    init        Create a minimal Objective-C UIKit project with a config file.
-    build       Run the full pipeline: compile, link, bundle, sign, package.
+    doctor       Check for clang, a Mach-O linker, ldid, zip and the SDK path.
+    init         Create a minimal Objective-C UIKit project with a config file,
+                 or write the inferred description into the current project.
+    build        Run the full pipeline: compile, link, bundle, sign, package.
+    sdk          Inspect, install, select, remove and print SDKs.
+    clean        Remove the generated build directory for a project.
+    completions  Print a hand-written shell completion script.
 
 BOOTSTRAP OPTIONS:
     --yes                 Accept every default; never prompt. Required in CI.
@@ -32,11 +49,16 @@ OPTIONS:
     --sdk PATH        Path to an extracted iPhoneOS SDK you provide.
                       Also read from $DARWINFORGE_SDK. darwinforge never downloads one.
     --arch ARCH       Target architecture (default: arm64).
-    --project PATH    Project directory (default: current directory).
+    --project PATH    Project directory (legacy alias for build's PATH).
     -o, --output FILE Where to write the .ipa (default: <project>/build/<Name>.ipa).
-    --bundle-id ID    Bundle identifier for `init` (default: com.example.<name>).
+    --bundle-id ID    Bundle identifier for `init`.
     --dir PATH        Parent directory for `init` (default: current directory).
-    --force           Overwrite an existing project in `init`.
+    --force           Overwrite an existing config in `init --here` or replace in `init`.
+    --here            With `init`, infer and write ./darwinforge.toml in place.
+    --fix             With `doctor`, apply safe SDK/config fixes.
+    --yes, -y         Answer yes to safe prompts.
+    --dry-run         With `clean`, print what would be removed.
+    --source URL      SDK repository for `bootstrap` or `sdk install`.
     -v, --verbose     Echo every external command before running it.
     -h, --help        Show this help.
     --version         Show the version.
@@ -64,11 +86,44 @@ EXIT CODES:
 pub enum Command {
     /// Prepare the machine. Idempotent and safe to re-run.
     Bootstrap(BootstrapOptions),
-    Doctor { sdk: Option<PathBuf> },
-    Init { name: String, bundle_id: Option<String>, dir: PathBuf, force: bool },
-    Build { sdk: Option<PathBuf>, arch: String, project: PathBuf, output: Option<PathBuf> },
+    Doctor { sdk: Option<PathBuf>, fix: bool },
+    Init {
+        name: Option<String>,
+        bundle_id: Option<String>,
+        dir: PathBuf,
+        force: bool,
+        here: bool,
+    },
+    Build {
+        sdk: Option<PathBuf>,
+        arch: String,
+        target: Option<PathBuf>,
+        project: Option<PathBuf>,
+        output: Option<PathBuf>,
+    },
+    Sdk(SdkOptions, SdkAction),
+    Clean { target: Option<PathBuf>, dry_run: bool },
+    Completions { shell: String },
     Help,
     Version,
+}
+
+/// Global SDK-management flags carried separately from the subcommand.
+#[derive(Debug, Clone, Default)]
+pub struct SdkOptions {
+    pub source: Option<String>,
+    pub yes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SdkAction {
+    /// Interactive picker, or a read-only listing when stdin is not a TTY.
+    Picker,
+    List { filter: Option<String> },
+    Install { requested: Option<String> },
+    Use { target: String },
+    Remove { requested: String },
+    Path,
 }
 
 /// Everything `bootstrap` can be told from the command line.
@@ -103,6 +158,9 @@ impl BootstrapOptions {
 pub struct Invocation {
     pub command: Command,
     pub verbose: bool,
+    pub yes: bool,
+    pub source: Option<String>,
+    pub dry_run: bool,
 }
 
 /// Parse `argv[1..]`.
@@ -115,7 +173,12 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
     let mut bundle_id: Option<String> = None;
     let mut dir: Option<PathBuf> = None;
     let mut force = false;
+    let mut yes = false;
+    let mut source: Option<String> = None;
+    let mut global_dry_run = false;
     let mut positional: Vec<String> = Vec::new();
+    let mut fix = false;
+    let mut here = false;
     let mut bootstrap = BootstrapOptions::default();
 
     let mut index = 0usize;
@@ -137,22 +200,46 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
         };
         match flag.as_str() {
             "-v" | "--verbose" => verbose = true,
-            "-h" | "--help" => return Ok(Invocation { command: Command::Help, verbose }),
-            "--version" => return Ok(Invocation { command: Command::Version, verbose }),
+            "-h" | "--help" => return Ok(Invocation {
+                command: Command::Help,
+                verbose,
+                yes,
+                source: source.clone(),
+                dry_run: global_dry_run,
+            }),
+            "--version" => return Ok(Invocation {
+                command: Command::Version,
+                verbose,
+                yes,
+                source: source.clone(),
+                dry_run: global_dry_run,
+            }),
             "--force" | "-f" => force = true,
+            "--here" => here = true,
+            "--fix" => fix = true,
             "--sdk" => sdk = Some(PathBuf::from(take_value(&mut index)?)),
             "--arch" => arch = Some(take_value(&mut index)?),
             "--project" | "-C" => project = Some(PathBuf::from(take_value(&mut index)?)),
             "-o" | "--output" => output = Some(PathBuf::from(take_value(&mut index)?)),
             "--bundle-id" => bundle_id = Some(take_value(&mut index)?),
             "--dir" => dir = Some(PathBuf::from(take_value(&mut index)?)),
-            // --- bootstrap flags --------------------------------------------
-            "--yes" | "-y" => bootstrap.yes = true,
+            // --- shared and bootstrap flags ---------------------------------
+            "--yes" | "-y" => {
+                yes = true;
+                bootstrap.yes = true;
+            }
             "--no-install" => bootstrap.no_install = true,
-            "--dry-run" => bootstrap.dry_run = true,
+            "--dry-run" => {
+                global_dry_run = true;
+                bootstrap.dry_run = true;
+            }
             "--accept-sdk-license" => bootstrap.accept_sdk_license = true,
             "--sdk-version" => bootstrap.sdk_version = Some(take_value(&mut index)?),
-            "--source" => bootstrap.source = Some(take_value(&mut index)?),
+            "--source" => {
+                let value = take_value(&mut index)?;
+                source = Some(value.clone());
+                bootstrap.source = Some(value);
+            }
             other if other.starts_with('-') => {
                 return Err(Error::Usage(format!("unknown option `{other}`")))
             }
@@ -182,24 +269,53 @@ let name = positional.first().cloned();
             if let Some(extra) = rest.first() {
                 return Err(Error::Usage(format!("unexpected argument `{extra}` for `doctor`")));
             }
-            Command::Doctor { sdk }
+            Command::Doctor { sdk, fix }
         }
         Some("init") => {
-            let name = rest
-                .first()
-                .cloned()
-                .ok_or_else(|| Error::Usage("`init` needs a project name".to_string()))?;
-            if let Some(extra) = rest.get(1) {
-                return Err(Error::Usage(format!("unexpected argument `{extra}` for `init`")));
+            if here {
+                if let Some(extra) = rest.first() {
+                    return Err(Error::Usage(format!(
+                        "unexpected argument `{extra}` for `init --here` (no project name is needed)"
+                    )));
+                }
+                Command::Init {
+                    name: None,
+                    bundle_id,
+                    dir: dir.unwrap_or_else(|| PathBuf::from(".")),
+                    force,
+                    here: true,
+                }
+            } else {
+                let name = rest
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| Error::Usage("`init` needs a project name".to_string()))?;
+                if let Some(extra) = rest.get(1) {
+                    return Err(Error::Usage(format!("unexpected argument `{extra}` for `init`")));
+                }
+                Command::Init {
+                    name: Some(name),
+                    bundle_id,
+                    dir: dir.unwrap_or_else(|| PathBuf::from(".")),
+                    force,
+                    here: false,
+                }
             }
-            Command::Init { name, bundle_id, dir: dir.unwrap_or_else(|| PathBuf::from(".")), force }
         }
         Some("build") => {
-            if let Some(extra) = rest.first() {
+            if rest.len() > 1 {
                 return Err(Error::Usage(format!(
-                    "unexpected argument `{extra}` for `build` (the project directory comes \
-                     from --project, default: current directory)"
+                    "unexpected argument `{}` for `build` (`build` takes at most one PATH)",
+                    rest[1]
                 )));
+            }
+            if let (Some(target), Some(project)) = (rest.first(), &project) {
+                if Path::new(target) != project.as_path() {
+                    return Err(Error::Usage(
+                        "pass the project either as `build PATH` or `build --project PATH`, not both"
+                            .to_string(),
+                    ));
+                }
             }
             let arch = arch.unwrap_or_else(|| "arm64".to_string());
             if arch != "arm64" {
@@ -210,18 +326,78 @@ let name = positional.first().cloned();
             Command::Build {
                 sdk,
                 arch,
-                project: project.unwrap_or_else(|| PathBuf::from(".")),
+                target: rest.first().map(PathBuf::from),
+                project,
                 output,
             }
         }
+        Some("sdk") => {
+            let action = match rest.as_slice() {
+                [] => SdkAction::Picker,
+                [sub] if sub == "list" => SdkAction::List { filter: None },
+                [sub, filter] if sub == "list" => SdkAction::List {
+                    filter: Some(filter.clone()),
+                },
+                [sub] if sub == "install" => SdkAction::Install { requested: None },
+                [sub, requested] if sub == "install" => SdkAction::Install {
+                    requested: Some(requested.clone()),
+                },
+                [sub, target] if sub == "use" => SdkAction::Use { target: target.clone() },
+                [sub, requested] if sub == "remove" => SdkAction::Remove {
+                    requested: requested.clone(),
+                },
+                [sub] if sub == "path" => SdkAction::Path,
+                [sub, ..] if sub == "list" => {
+                    return Err(Error::Usage("`sdk list` takes at most one FILTER".to_string()))
+                }
+                [sub, ..] if sub == "install" => {
+                    return Err(Error::Usage("`sdk install` takes at most one VERSION".to_string()))
+                }
+                [sub, ..] if sub == "use" => {
+                    return Err(Error::Usage("`sdk use` needs exactly one VERSION or PATH".to_string()))
+                }
+                [sub, ..] if sub == "remove" => {
+                    return Err(Error::Usage("`sdk remove` needs exactly one VERSION".to_string()))
+                }
+                [sub, ..] if sub == "path" => {
+                    return Err(Error::Usage("`sdk path` takes no arguments".to_string()))
+                }
+                [other, ..] => {
+                    return Err(Error::Usage(format!(
+                        "unknown `sdk` subcommand `{other}`; expected list, install, use, remove, path"
+                    )))
+                }
+            };
+            Command::Sdk(
+                SdkOptions { source: source.clone(), yes },
+                action,
+            )
+        }
+        Some("clean") => {
+            if rest.len() > 1 {
+                return Err(Error::Usage(format!(
+                    "unexpected argument `{}` for `clean`",
+                    rest[1]
+                )));
+            }
+            Command::Clean { target: rest.first().map(PathBuf::from), dry_run: global_dry_run }
+        }
+        Some("completions") => match rest.as_slice() {
+            [shell] => Command::Completions { shell: shell.clone() },
+            _ => {
+                return Err(Error::Usage(
+                    "`completions` needs one shell: bash, zsh, fish, or powershell".to_string(),
+                ))
+            }
+        },
         Some(other) => {
             return Err(Error::Usage(format!(
                 "unknown command `{other}`; expected one of: \
-                 bootstrap, doctor, init, build"
+                 bootstrap, doctor, init, build, sdk, clean, completions"
             )))
         }
     };
-    Ok(Invocation { command, verbose })
+    Ok(Invocation { command, verbose, yes, source, dry_run: global_dry_run })
 }
 
 #[cfg(test)]
@@ -235,7 +411,7 @@ mod tests {
     #[test]
     fn parses_doctor() {
         let invocation = parse(&args(&["doctor"])).expect("parses");
-        assert!(matches!(invocation.command, Command::Doctor { sdk: None }));
+        assert!(matches!(invocation.command, Command::Doctor { sdk: None, fix: false }));
         assert!(!invocation.verbose);
     }
 
@@ -261,7 +437,7 @@ mod tests {
         match invocation.command {
             Command::Build { sdk, project, .. } => {
                 assert_eq!(sdk, Some(PathBuf::from("/sdk")));
-                assert_eq!(project, PathBuf::from("/p"));
+                assert_eq!(project, Some(PathBuf::from("/p")));
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -273,7 +449,7 @@ mod tests {
             parse(&args(&["init", "Hello", "--bundle-id", "com.acme.hi"])).expect("parses");
         match invocation.command {
             Command::Init { name, bundle_id, force, .. } => {
-                assert_eq!(name, "Hello");
+                assert_eq!(name.as_deref(), Some("Hello"));
                 assert_eq!(bundle_id.as_deref(), Some("com.acme.hi"));
                 assert!(!force);
             }
@@ -394,6 +570,61 @@ mod tests {
     fn bootstrap_rejects_stray_positional_arguments() {
         let error = parse(&args(&["bootstrap", "please"])).expect_err("must fail");
         assert!(error.to_string().contains("please"), "{error}");
+    }
+
+    #[test]
+    fn build_accepts_a_positional_target_and_rejects_a_conflicting_flag() {
+        let invocation = parse(&args(&["build", "MyApp"])).expect("parses");
+        match invocation.command {
+            Command::Build { target, project, .. } => {
+                assert_eq!(target, Some(PathBuf::from("MyApp")));
+                assert!(project.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let error = parse(&args(&["build", "MyApp", "--project", "Other"])).expect_err("conflict");
+        assert!(error.to_string().contains("PATH"), "{error}");
+    }
+
+    #[test]
+    fn parses_the_new_phase_two_commands() {
+        let init = parse(&args(&["init", "--here", "--force"])).expect("parses");
+        assert!(matches!(
+            init.command,
+            Command::Init { name: None, here: true, force: true, .. }
+        ));
+
+        let doctor = parse(&args(&["doctor", "--fix", "--yes"])).expect("parses");
+        match doctor.command {
+            Command::Doctor { fix, .. } => assert!(fix),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(doctor.yes);
+
+        let sdk = parse(&args(&["sdk", "install", "17.5", "--yes"])).expect("parses");
+        match sdk.command {
+            Command::Sdk(options, SdkAction::Install { requested }) => {
+                assert_eq!(requested.as_deref(), Some("17.5"));
+                assert!(options.yes);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let clean = parse(&args(&["clean", "MyApp", "--dry-run"])).expect("parses");
+        match clean.command {
+            Command::Clean { target, dry_run } => {
+                assert_eq!(target, Some(PathBuf::from("MyApp")));
+                assert!(dry_run);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let completions = parse(&args(&["completions", "powershell"])).expect("parses");
+        assert!(matches!(
+            completions.command,
+            Command::Completions { shell } if shell == "powershell"
+        ));
     }
 
     #[test]

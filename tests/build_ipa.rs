@@ -605,13 +605,36 @@ fn cli_builds_the_sample_project_end_to_end() {
     );
     assert!(project.join("build/Hello.ipa").is_file());
 
-    // A missing SDK must fail with the documented exit code and an actionable
-    // message, not a panic or a silent success.
+    // With no SDK configured anywhere — no flag, no environment, no saved
+    // config, no installed SDK — the build must fail with the documented exit
+    // code and an actionable message, not a panic or a silent success.
+    //
+    // The code is **5**, not 4: the unified resolution now reports "nothing is
+    // configured" as a *setup* problem, matching `bootstrap` and the preflight,
+    // so a fresh machine gets the same "run bootstrap" advice everywhere.
+    // (Exit 4 remains for a named-but-wrong SDK path.)
     let failed = run(&["build"]);
-    assert_eq!(failed.status.code(), Some(4), "missing-SDK exit code");
+    assert_eq!(failed.status.code(), Some(5), "no-SDK-anywhere exit code");
     let stderr = String::from_utf8_lossy(&failed.stderr);
-    assert!(stderr.contains("no iPhoneOS SDK given"), "got: {stderr}");
+    assert!(stderr.contains("no iPhoneOS SDK is configured"), "got: {stderr}");
     assert!(stderr.contains("--sdk"), "the error must say how to fix it: {stderr}");
+    assert!(
+        stderr.contains("sdk install") && stderr.contains("DARWINFORGE_SDK"),
+        "and must name every source it consulted: {stderr}"
+    );
+
+    // A `--sdk` pointing at a directory that is not an SDK stays a *prerequisite*
+    // error (exit 4): the user named a path, and it is the wrong one.
+    let bogus = Scratch::new("bogus-sdk");
+    std::fs::create_dir_all(bogus.path("not-an-sdk")).expect("mkdir");
+    let wrong = run(&["build", "--sdk", bogus.path("not-an-sdk").to_str().unwrap()]);
+    assert_eq!(
+        wrong.status.code(),
+        Some(4),
+        "a named-but-invalid SDK is exit 4, not 5"
+    );
+    let stderr = String::from_utf8_lossy(&wrong.stderr);
+    assert!(stderr.contains("not-an-sdk"), "and it names the path: {stderr}");
 
     // Unknown flags are a usage error (exit 2).
     let usage = run(&["build", "--nonsense"]);

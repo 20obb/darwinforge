@@ -7,6 +7,33 @@ use std::path::{Path, PathBuf};
 /// Convenience alias used by every module in the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The minimal description of a `git` command an [`Error::GitFailed`] carries.
+///
+/// Declared here, rather than reusing [`crate::sdksource::GitCommand`], so the
+/// error type stays free of a dependency on the SDK subsystem: errors must be
+/// printable from anywhere, including from modules that do not know how an SDK
+/// is fetched. Only what a message needs is kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCommandRef {
+    /// Where the command ran, when a directory was in play.
+    pub cwd: Option<PathBuf>,
+    /// The arguments, in `git`'s own spelling.
+    pub args: Vec<String>,
+}
+
+impl GitCommandRef {
+    /// `git <args>`, for a one-line message.
+    pub fn display(&self) -> String {
+        format!("git {}", self.args.join(" "))
+    }
+}
+
+impl fmt::Display for GitCommandRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.display())
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     /// Bad command line. Exit code 2, same as most Unix tools.
@@ -21,6 +48,17 @@ pub enum Error {
     ToolFailed {
         program: String,
         args: Vec<String>,
+        code: Option<i32>,
+    },
+    /// A `git` invocation failed.
+    ///
+    /// Separate from [`Error::ToolFailed`] because git is the one tool whose
+    /// *stderr* is the useful diagnostic: "repository not found", "permission
+    /// denied", "remote hung up". Carrying the command and its stderr lets the
+    /// SDK-discovery error quote git instead of just saying it failed.
+    GitFailed {
+        command: Box<GitCommandRef>,
+        stderr: String,
         code: Option<i32>,
     },
     /// A prerequisite (tool or SDK path) is missing; carries the fix hint.
@@ -54,6 +92,9 @@ impl Error {
             Error::Usage(_) => 2,
             Error::Config { .. } => 3,
             Error::ToolFailed { .. } | Error::Io { .. } | Error::Format { .. } => 1,
+            // A git failure is a tool failure, so it keeps the tool exit code:
+            // a caller must not have to special-case git to notice the failure.
+            Error::GitFailed { .. } => 1,
             Error::Prereq { .. } | Error::Unsupported { .. } => 4,
             Error::Setup { .. } => 5,
         }
@@ -93,6 +134,22 @@ impl fmt::Display for Error {
                     f,
                     "\n  The tool's own diagnostics are printed above, unfiltered."
                 )
+            }
+            Error::GitFailed { command, stderr, code } => {
+                write!(f, "`{command}` failed")?;
+                match code {
+                    Some(code) => write!(f, " with exit code {code}")?,
+                    None => write!(f, " (killed by signal)")?,
+                }
+                // git's stderr is the actual explanation; without it the user
+                // is told only that a command they never ran did not work.
+                if !stderr.trim().is_empty() {
+                    write!(f, "\n  git said: {}", stderr.trim())?;
+                }
+                if let Some(cwd) = &command.cwd {
+                    write!(f, "\n  it ran in: {}", cwd.display())?;
+                }
+                Ok(())
             }
             Error::Prereq { what, fix } => write!(f, "{what}\n  fix: {fix}"),
             Error::Setup { what, fix } => write!(f, "{what}\n  fix: {fix}"),

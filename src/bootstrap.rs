@@ -70,7 +70,7 @@ pub fn run(options: &BootstrapOptions, reporter: &Reporter) -> Result<()> {
         println!();
     }
 
-    print_summary(&plan, reporter)
+    print_summary(&plan, options, reporter)
 }
 
 fn print_host(host: &Host, options: &BootstrapOptions) {
@@ -100,7 +100,10 @@ fn tool_steps(
 ) -> Result<Vec<Step>> {
     let host = detect_host();
     let mut steps = Vec::new();
-    let mut missing: Vec<(&str, Option<&str>, bool)> = Vec::new();
+    // `(name, package, available, required)` — `required` travels with each
+    // tool so an optional one is reported as `[skipped]` with a reason rather
+    // than `[failed]`, and so it never counts as outstanding work.
+    let mut missing: Vec<(&str, Option<&str>, bool, bool)> = Vec::new();
 
     for spec in toolfind::all_specs() {
         // cctools `ld` is a fallback for the linker, not a separate install.
@@ -111,9 +114,21 @@ fn tool_steps(
         match toolfind::find(spec, configured.as_deref()) {
             Some(found) => {
                 store_tool(config, spec.name, &found.path);
-                let version = match found.version {
-                    Some(number) => format!("version {number}"),
-                    None => "version unknown".to_string(),
+                // Prefer what the binary itself reports. The version in the
+                // *filename* is only a fallback: it exists at all when the name
+                // is version-suffixed (`clang-21`), so an unversioned `clang`
+                // on PATH was reported as "version unknown" even though asking
+                // it would have answered. The reported string is already a
+                // complete line ("clang version 21.1.0"), so it is used as-is.
+                let version = match found.reported_version(&toolfind::probe_version) {
+                    Some(reported) => reported,
+                    None => match found.version {
+                        Some(number) => format!("version {number} (from the file name)"),
+                        None => format!(
+                            "{} did not report a version",
+                            found.path.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                    },
                 };
                 steps.push(
                     Step::check(spec.name, format!("using {}", paths::display_path(&found.path)))
@@ -134,7 +149,7 @@ fn tool_steps(
                 } else {
                     package.is_some()
                 };
-                missing.push((spec.name, package, available));
+                missing.push((spec.name, package, available, spec.required));
             }
         }
     }
@@ -143,6 +158,14 @@ fn tool_steps(
     if !missing.is_empty() {
         let planned = crate::plan::plan_tool_installs(host.package_manager, &missing);
         for step in planned.steps {
+            // On Windows, a missing `ldid` is not a package problem: there is no
+            // official Windows build, so no manager will ever provide one and
+            // "no package for ldid on winget" is a dead end. Check for WSL and
+            // recommend the bridge, naming the distribution that would work.
+            if cfg!(windows) && step.name == toolfind::LDID.name && step.status != Status::Ok {
+                steps.push(crate::windows::ldid_on_windows(&crate::windows::wsl_distros()));
+                continue;
+            }
             // Only a step that carries a real, probed-available command can be
             // executed; a failed or skipped plan step has nothing to run.
             let executable = step.status == Status::Ok && !step.commands.is_empty();
@@ -340,17 +363,39 @@ fn install_sdk(
 ) -> Result<Step> {
     let step = Step::check("sdk", format!("install iPhoneOS {requested} from {source}"));
     let runner = sdksource::run_git;
-    let sdks = match sdksource::discover(source, &runner) {
-        Ok(found) if found.is_empty() => {
-            return Ok(step.with_outcome(Status::Failed, sdksource::no_sdks_error(&[]).to_string()))
-        }
+    // The detailed form, so an empty listing can be explained with the refs that
+    // were probed and the git commands that ran, rather than a bare "no SDKs".
+    let found = match sdksource::discover_detailed(source, &runner) {
         Ok(found) => found,
         Err(error) => return Ok(step.with_outcome(Status::Failed, error.to_string())),
     };
-    let chosen = match sdksource::select(&sdks, Some(requested)) {
-        Ok(chosen) => chosen,
-        Err(error) => return Ok(step.with_outcome(Status::Failed, error.to_string())),
+    let refs: Vec<&str> = found.refs_tried.iter().map(String::as_str).collect();
+    if found.sdks.is_empty() {
+        return Ok(step.with_outcome(
+            Status::Failed,
+            sdksource::no_sdks_error(&refs, Some(&found.trace)).to_string(),
+        ));
+    }
+
+    // `latest` is a keyword, not a version. Passing it through to `select` as
+    // though it were one made every default bootstrap run fail with "offers no
+    // version latest"; `select` now interprets it, but the non-interactive case
+    // must also *say* which SDK it settled on.
+    let mut notice: Option<String> = None;
+    let chosen = if sdksource::is_latest_request(Some(requested)) {
+        match sdksource::select_latest(&found.sdks, notice.as_mut()) {
+            Ok(chosen) => chosen,
+            Err(error) => return Ok(step.with_outcome(Status::Failed, error.to_string())),
+        }
+    } else {
+        match sdksource::select(&found.sdks, Some(requested)) {
+            Ok(chosen) => chosen,
+            Err(error) => return Ok(step.with_outcome(Status::Failed, error.to_string())),
+        }
     };
+    if let Some(warning) = notice {
+        println!("  note      {warning}");
+    }
     println!("  selected  {}", chosen.name);
 
     match sdksource::install(source, &chosen, &runner, true) {
@@ -373,7 +418,16 @@ fn install_sdk(
 }
 
 /// Print the end-of-run summary and the next command.
-fn print_summary(plan: &Plan, reporter: &Reporter) -> Result<()> {
+///
+/// The exit code is deliberately split from the wording:
+///
+/// * nothing outstanding → 0, "the environment is ready";
+/// * a **read-only** run with work still to do → **5**, but the wording leads
+///   with "the plan is valid" and gives the count, because the non-zero exit is
+///   there to stop a script assuming work was done — not to report that
+///   anything is wrong with the plan. Reading the old "the environment is NOT
+///   ready" as an error is exactly what that phrasing invited.
+fn print_summary(plan: &Plan, options: &BootstrapOptions, reporter: &Reporter) -> Result<()> {
     println!("summary");
     println!("-------");
     for (status, label) in [
@@ -384,6 +438,17 @@ fn print_summary(plan: &Plan, reporter: &Reporter) -> Result<()> {
     ] {
         let count = plan.steps.iter().filter(|step| step.status == status).count();
         println!("  {label:<9} {count}");
+    }
+    // Optional tools that were passed up are listed separately: they were
+    // reported above as [skipped], and saying so here stops them reading as
+    // outstanding work.
+    let optional = plan.skipped_optional();
+    if !optional.is_empty() {
+        println!();
+        println!("optional, not needed to build:");
+        for step in optional {
+            println!("  {:<12} {}", step.name, step.detail.as_deref().unwrap_or(""));
+        }
     }
     println!();
 
@@ -396,17 +461,43 @@ fn print_summary(plan: &Plan, reporter: &Reporter) -> Result<()> {
     }
 
     // Something was planned but not carried out (a dry run, or a declined
-    // install). Say so rather than claiming the machine is ready.
+    // install). Say so plainly, without dressing it as a failure.
     if plan.is_complete() && plan.has_pending_work() {
-        println!("Nothing was changed: this was a read-only run.");
+        let pending = plan.pending_count();
+        let noun = if pending == 1 { "item" } else { "items" };
+        // The wording changes with *why* nothing was done, because the two cases
+        // need different reassurance: a read-only run needs "your plan is
+        // sound", a declined install needs "nothing was done to your machine".
+        if options.is_read_only() {
+            println!(
+                "The plan is valid: {pending} {noun} would be installed by a real run.\n\
+                 Nothing was changed, because this was a read-only run."
+            );
+        } else {
+            println!(
+                "The plan is valid: {pending} {noun} are still outstanding.\n\
+                 Nothing was installed without your confirmation."
+            );
+        }
         println!();
         println!("next: darwinforge bootstrap            # actually install");
         println!("      darwinforge bootstrap --dry-run  # show the plan only");
-        return Ok(());
+        // Non-zero: a caller must be able to tell that no work was done.
+        return Err(Error::setup(
+            format!("nothing was installed: {pending} {noun} still outstanding"),
+            format!(
+                "run `darwinforge bootstrap` to install {pending} {noun} on this machine. \
+                 Exit code 5 means the environment is not ready; it does not mean the \
+                 plan was invalid"
+            ),
+        ));
     }
 
     println!("The environment is NOT ready. Outstanding items:");
     println!();
+    // `incomplete()` already excludes optional steps, so a machine that is
+    // merely missing `zip` never appears on this list.
+    let outstanding = plan.incomplete().len();
     for step in plan.incomplete() {
         println!("  {} — {}", step.name, step.action);
         if let Some(detail) = &step.detail {
@@ -421,7 +512,7 @@ fn print_summary(plan: &Plan, reporter: &Reporter) -> Result<()> {
         println!("note: {} warning(s) during setup", reporter.warning_count());
     }
     Err(Error::setup(
-        format!("{} item(s) still outstanding", plan.incomplete().len()),
+        format!("{outstanding} required item(s) still outstanding"),
         "run `darwinforge bootstrap` to finish setting up, or `darwinforge doctor` for details",
     ))
 }
@@ -481,7 +572,7 @@ mod tests {
     #[test]
     fn a_complete_plan_ends_with_the_next_command() {
         let plan = Plan { steps: vec![Step::check("clang", "using /usr/bin/clang")] };
-        assert!(print_summary(&plan, &Reporter::new(false)).is_ok());
+        assert!(print_summary(&plan, &BootstrapOptions::default(), &Reporter::new(false)).is_ok());
     }
 
     #[test]
@@ -490,7 +581,8 @@ mod tests {
             steps: vec![Step::check("ldid", "obtain ldid")
                 .with_outcome(Status::Failed, "not packaged")],
         };
-        let error = print_summary(&plan, &Reporter::new(false)).expect_err("must fail");
+        let error = print_summary(&plan, &BootstrapOptions::default(), &Reporter::new(false))
+            .expect_err("must fail");
         assert_eq!(error.exit_code(), 5, "an unusable environment is exit code 5");
         assert!(error.to_string().contains("bootstrap"), "must say how to fix it");
     }
@@ -503,8 +595,91 @@ mod tests {
         };
         assert!(!plan.is_complete());
         assert_eq!(
-            print_summary(&plan, &Reporter::new(false)).expect_err("must fail").exit_code(),
+            print_summary(&plan, &BootstrapOptions::default(), &Reporter::new(false))
+                .expect_err("must fail")
+                .exit_code(),
             5
+        );
+    }
+
+    // ---- bug: an optional tool must never be a failure ---------------------
+
+    #[test]
+    fn a_missing_optional_tool_does_not_fail_the_run() {
+        // The reported bug: bootstrap and doctor disagreed about `zip` on
+        // Windows, and because it was planned as a `[failed]` step, a machine
+        // that builds perfectly well exited 5.
+        let plan = Plan {
+            steps: vec![
+                Step::check("clang", "using /usr/bin/clang"),
+                Step::check("zip", "install zip")
+                    .optional()
+                    .with_outcome(Status::Skipped, "no package for zip on winget"),
+            ],
+        };
+        assert!(plan.is_complete(), "an absent zip must not block a build");
+        assert!(plan.incomplete().is_empty(), "and must not be outstanding");
+        assert!(
+            print_summary(&plan, &BootstrapOptions::default(), &Reporter::new(false)).is_ok(),
+            "the run must succeed"
+        );
+        // It is still *reported*, so the user knows what was passed up.
+        assert_eq!(plan.skipped_optional().len(), 1);
+    }
+
+    #[test]
+    fn a_missing_required_tool_still_fails_even_beside_a_skipped_optional_one() {
+        let plan = Plan {
+            steps: vec![
+                Step::check("zip", "install zip").optional().with_outcome(Status::Skipped, "n/a"),
+                Step::check("ldid", "obtain ldid").with_outcome(Status::Failed, "not packaged"),
+            ],
+        };
+        assert!(!plan.is_complete(), "ldid is required");
+        assert_eq!(plan.incomplete().len(), 1, "only the required one counts");
+        assert_eq!(plan.incomplete()[0].name, "ldid");
+    }
+
+    #[test]
+    fn a_working_machine_with_no_optional_tools_installed_exits_zero() {
+        // The whole point of the fix, as a single assertion.
+        let plan = Plan {
+            steps: vec![
+                Step::check("clang", "using /usr/bin/clang"),
+                Step::check("ld64.lld", "using /usr/bin/ld64.lld"),
+                Step::check("ldid", "using /usr/local/bin/ldid"),
+            ],
+        };
+        assert!(plan.is_complete());
+        assert_eq!(plan.pending_count(), 0);
+        assert!(print_summary(&plan, &BootstrapOptions::default(), &Reporter::new(false)).is_ok());
+    }
+
+    #[test]
+    fn a_dry_run_that_would_install_says_the_plan_is_valid_and_still_exits_five() {
+        // Bug: the dry run exited non-zero with wording that read as an error.
+        // The exit code must stay non-zero (nothing was installed), but the
+        // message must not look like a failure.
+        let plan = Plan {
+            steps: vec![
+                Step::check("clang", "using /usr/bin/clang"),
+                crate::plan::plan_package_install(
+                    "ldid",
+                    crate::distro::PackageManager::Apt,
+                    Some("ldid"),
+                    true,
+                ),
+            ],
+        };
+        assert!(plan.has_pending_work(), "an install command is pending");
+        let options = BootstrapOptions { dry_run: true, ..Default::default() };
+        let error = print_summary(&plan, &options, &Reporter::new(false)).expect_err("must fail");
+        assert_eq!(error.exit_code(), 5, "still non-zero: no work was done");
+        assert_eq!(plan.pending_count(), 1, "one item would be installed");
+        let text = error.to_string();
+        assert!(
+            text.contains("Exit code 5") && text.contains("not mean the plan was invalid"),
+            "the exit code is explained so it is not read as an error: {text}"
         );
     }
 

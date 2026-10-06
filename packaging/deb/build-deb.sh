@@ -24,8 +24,10 @@
 set -eu
 
 PACKAGE='darwinforge'
-MAINTAINER='DarwinForge contributors <darwinforge@example.invalid>'
-HOMEPAGE='https://github.com/darwinforge/darwinforge'
+# Overridable so a fork does not have to edit this file: build-deb.sh reads it
+# from the environment when set. Debian requires a real, deliverable address.
+MAINTAINER="${MAINTAINER:-20obb <20obb@users.noreply.github.com>}"
+HOMEPAGE='https://github.com/20obb/darwinforge'
 SECTION='devel'
 PRIORITY='optional'
 # The short description must stay on ONE line: deb-control treats a leading

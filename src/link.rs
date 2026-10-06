@@ -296,6 +296,80 @@ mod tests {
     }
 
     #[test]
+    fn an_objective_c_project_needs_no_declared_libraries_at_all() {
+        // The exact reported failure: a config with `libraries = []` — the
+        // default — linked against a real SDK and died on
+        // `undefined symbol: ___stack_chk_fail`. Nothing in the user's file
+        // mentions System or objc, so only the defaults can supply them.
+        let text = r#"
+            [app]
+            name = "Hello"
+            bundle_id = "com.example.hello"
+            min_ios_version = "13.0"
+        "#;
+        let config = Config::from_str(text, Path::new("/project")).expect("valid config");
+        assert!(config.build.libraries.is_empty(), "no libraries declared");
+        let args = link_arguments(
+            &config,
+            &sdk(),
+            LinkerKind::Lld,
+            &[PathBuf::from("/project/build/main.o")],
+            Path::new("/out"),
+            "arm64",
+        );
+        assert!(
+            args.contains(&"-lSystem".to_string()),
+            "___stack_chk_fail / ___stack_chk_guard would otherwise be undefined: {args:?}"
+        );
+        assert!(
+            args.contains(&"-lobjc".to_string()),
+            "the Objective-C runtime would otherwise be undefined: {args:?}"
+        );
+    }
+
+    #[test]
+    fn a_c_project_gets_the_same_defaults() {
+        // Stack protection is on for C too, so `-lSystem` is not
+        // Objective-C-specific and must not be gated on it.
+        let text = r#"
+            [app]
+            name = "Plain"
+            bundle_id = "com.example.plain"
+            min_ios_version = "13.0"
+        "#;
+        let config = Config::from_str(text, Path::new("/project")).expect("valid config");
+        let args = link_arguments(
+            &config,
+            &sdk(),
+            LinkerKind::Lld,
+            &[PathBuf::from("/project/build/main.o")],
+            Path::new("/out"),
+            "arm64",
+        );
+        assert!(args.contains(&"-lSystem".to_string()), "clang emits stack_chk for C too");
+    }
+
+    #[test]
+    fn the_implicit_libraries_are_added_after_the_objects_so_they_can_resolve() {
+        // Linker semantics: `-l` flags are order-sensitive for static archives,
+        // and the implicit libraries must appear after the objects that need
+        // them. Putting them first is a classic cause of "undefined symbol"
+        // even when the flag is present.
+        let args = args();
+        let last_object = args
+            .iter()
+            .rposition(|arg| arg.ends_with(".o"))
+            .expect("an object must be present");
+        let system = args.iter().position(|arg| arg == "-lSystem").expect("present");
+        let objc = args.iter().position(|arg| arg == "-lobjc").expect("present");
+        assert!(
+            system > last_object,
+            "-lSystem must follow the objects: {args:?}"
+        );
+        assert!(objc > last_object, "-lobjc must follow the objects: {args:?}");
+    }
+
+    #[test]
     fn implicit_libraries_are_not_duplicated_when_already_listed() {
         let text = r#"
             [app]

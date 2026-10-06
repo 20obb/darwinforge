@@ -129,6 +129,59 @@ pub fn default_bundle_id(app_name: &str) -> String {
     }
 }
 
+/// Infer the project in `dir` and write its description in place.
+///
+/// This is the fixed point after which `darwinforge build` no longer guesses:
+/// the same rendered TOML it writes is what zero-config inference would have
+/// used, so the two modes cannot disagree.
+pub fn init_here(
+    dir: &Path,
+    bundle_id: Option<&str>,
+    force: bool,
+    sdk_version: Option<&str>,
+) -> Result<PathBuf> {
+    let root = if dir.is_dir() {
+        dir.to_path_buf()
+    } else if dir.is_file() {
+        dir.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .ok_or_else(|| Error::Usage(format!("{} is not a usable project path", dir.display())))?
+    } else {
+        return Err(Error::Prereq {
+            what: format!("{} does not exist", dir.display()),
+            fix: "run from a project directory, or pass --dir PATH".to_string(),
+        });
+    };
+
+    if crate::compat::find_project_config(&root).is_some() && !force {
+        return Err(Error::Usage(format!(
+            "{} already exists; use `darwinforge init --here --force` to replace it",
+            root.join(crate::compat::CONFIG_FILE_NAME).display()
+        )));
+    }
+
+    let mut inferred = crate::infer::infer(&root, sdk_version)?;
+    if let Some(bundle_id) = bundle_id {
+        inferred.bundle_id = bundle_id.to_string();
+    }
+    let text = crate::infer::render(&inferred);
+    let path = root.join(crate::compat::CONFIG_FILE_NAME);
+    std::fs::write(&path, text).map_err(|source| {
+        Error::io(format!("cannot write {}", path.display()), source)
+    })?;
+    println!("wrote {}", path.display());
+    println!("inferred: name = \"{}\", bundle_id = \"{}\"", inferred.name, inferred.bundle_id);
+    println!(
+        "  {} source file(s), {} framework(s), min iOS {} ({})",
+        inferred.source_paths.len(),
+        inferred.frameworks.len(),
+        inferred.min_ios_version,
+        inferred.min_ios_origin,
+    );
+    Ok(path)
+}
+
 /// Create a new project directory. Refuses to overwrite an existing one.
 pub fn run(name: &str, bundle_id: Option<&str>, parent: &Path, force: bool) -> Result<PathBuf> {
     // The app name is the final path component only; the full argument still
@@ -187,6 +240,82 @@ mod tests {
     }
 
     #[test]
+    fn init_with_a_path_argument_creates_a_project_that_parses() {
+        // The reported bug: `init ~/MyApp` wrote the whole path into app.name and
+        // produced a config that could not be used. This runs the real scaffold
+        // function and then parses what it actually wrote, rather than checking
+        // the derivation in isolation.
+        let dir = std::env::temp_dir()
+            .join(format!("darwinforge-scaffold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // A nested path with several components, exactly as a user would type it.
+        let nested = dir.join("one").join("two").join("MyApp");
+        let created = run("one/two/MyApp", None, &dir, false).expect("init must succeed");
+        assert!(created.is_dir(), "the project directory exists");
+        assert_eq!(created, nested, "and is where the argument said");
+
+        let text = std::fs::read_to_string(created.join("darwinforge.toml")).expect("config");
+        // No path separator may leak into any generated value.
+        assert!(!text.contains("one/two"), "no path leaked into the config:\n{text}");
+        let config = Config::from_str(&text, &created).expect("the generated config must parse");
+        assert_eq!(config.app.name, "MyApp", "the last component is the app name");
+        assert_eq!(config.app.bundle_id, "com.example.myapp");
+        assert_eq!(config.app_bundle_name(), "MyApp.app");
+        assert!(!config.app.name.contains('/') && !config.app.name.contains('\\'));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_sanitises_the_bundle_id_from_a_path_argument() {
+        // The identifier is the second half of the reported bug: it must be
+        // lowercase and restricted to [a-z0-9-], with no separator and no dot
+        // smuggled in from the file name.
+        let dir = std::env::temp_dir()
+            .join(format!("darwinforge-scaffold-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        for (argument, expected) in [
+            ("MyApp", "com.example.myapp"),
+            ("my-cool-app", "com.example.my-cool-app"),
+            ("My App", "com.example.myapp"),
+            ("App_2", "com.example.app2"),
+        ] {
+            let created = run(argument, None, &dir, true).expect("init must succeed");
+            let text =
+                std::fs::read_to_string(created.join("darwinforge.toml")).expect("config");
+            let config = Config::from_str(&text, &created).expect("must parse");
+            assert_eq!(config.app.bundle_id, expected, "argument {argument:?}");
+            let id = &config.app.bundle_id;
+            assert!(
+                id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'),
+                "only [a-z0-9-.] are allowed, got {id:?}"
+            );
+            assert!(id.split('.').count() >= 2, "reverse-DNS, got {id:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_refuses_to_clobber_an_existing_project_without_force() {
+        let dir = std::env::temp_dir()
+            .join(format!("darwinforge-scaffold-clobber-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        run("Clob", None, &dir, false).expect("first init");
+        let error = run("Clob", None, &dir, false).expect_err("must refuse");
+        assert!(error.to_string().contains("already exists"), "{error}");
+        // With --force it goes through, and the result is still valid.
+        let created = run("Clob", None, &dir, true).expect("forced init");
+        let text = std::fs::read_to_string(created.join("darwinforge.toml")).expect("config");
+        assert!(Config::from_str(&text, &created).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn generated_config_parses() {
         let config_text = find("darwinforge.toml");
         let config = Config::from_str(&config_text, Path::new("/tmp/Hello")).expect("must parse");
@@ -232,6 +361,35 @@ mod tests {
     fn a_trailing_app_suffix_is_not_doubled() {
         assert_eq!(derive_app_name("Hello.app"), "Hello");
         assert_eq!(derive_app_name("/tmp/Hello.app"), "Hello");
+    }
+
+    #[test]
+    fn init_here_writes_the_inferred_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "darwinforge-init-here-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("main.m"),
+            "#import <UIKit/UIKit.h>\nint main(void){return 0;}\n",
+        )
+        .expect("source");
+
+        let written = init_here(&dir, None, false, Some("17.5")).expect("init --here");
+        let text = std::fs::read_to_string(&written).expect("config");
+        let config = Config::from_str(&text, &dir).expect("config parses");
+        assert_eq!(config.app.min_ios_version, "17.5");
+        assert_eq!(config.build.frameworks, ["UIKit"]);
+        assert_eq!(config.build.sources, ["main.m"]);
+
+        let error = init_here(&dir, None, false, None).expect_err("must not clobber");
+        assert!(error.to_string().contains("--force"), "{error}");
+        init_here(&dir, Some("com.example.custom"), true, None).expect("replace");
+        let text = std::fs::read_to_string(&written).expect("config");
+        assert!(text.contains("com.example.custom"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

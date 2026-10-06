@@ -29,7 +29,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, GitCommandRef, Result};
 use crate::paths;
 use crate::sdk::Sdk;
 
@@ -74,45 +74,161 @@ pub fn resolve_source(configured: Option<&str>, override_flag: Option<&str>) -> 
 ///
 /// `17.5 < 17.10 < 18.0 < 18.1`, which string comparison gets wrong:
 /// `"17.10" < "17.5"` lexicographically, so a user asking for the newest SDK
-/// would be handed a five-year-old one. Deriving [`Ord`] on the component
-/// vector makes that class of bug impossible rather than merely avoided.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// would be handed a five-year-old one.
+///
+/// Three-component versions (`17.0.2`, `26.4.1`) are ordinary point releases
+/// and compare as three numbers. A pre-release suffix (`18.0b3`, `26.0rc1`) is
+/// kept as its **own component** rather than rejected, for two reasons: such an
+/// SDK really is published and must be listed, and it must be *identifiable* as
+/// a pre-release — a parser that refused it outright could neither offer it nor
+/// warn the user about it.
+///
+/// The suffix is stored as a separate [`SdkVersion::pre`] entry rather than
+/// being glued onto the numeric part of its component, because that keeps the
+/// numeric vector purely numeric: `18.0b3` is `[18, 0]` plus the tag `b3`, so
+/// it sorts by its numbers against every other version without a special case.
+///
+/// Ordering is numeric per component, with a pre-release sorting **before** the
+/// release it leads up to: `18.0b3 < 18.0`, as semantic versioning specifies.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SdkVersion {
     /// The numeric components, most significant first: `17.10` is `[17, 10]`.
     pub parts: Vec<u32>,
+    /// A pre-release tag carried by the last component, e.g. `b3` in `18.0b3`.
+    ///
+    /// `None` for an ordinary release. Comparison uses this only to break ties
+    /// *after* the numeric parts are equal.
+    pub pre: Option<String>,
 }
 
 impl SdkVersion {
-    /// Parse `17.5`, `17.10` or `17.5.1`.
+    /// Parse `17.5`, `17.10`, `17.0.2` or `18.0b3`.
     ///
-    /// Every component must be a non-empty run of digits. Anything else —
-    /// `17.x`, `latest`, an empty string — is rejected, because a version this
-    /// module cannot order must never be presented as one it can.
+    /// Each component is a leading run of digits (the value) optionally followed
+    /// by a non-digit suffix (the pre-release tag), so `18b3` parses as 18 with
+    /// tag `b3`. A suffix on anything but the **last** component is rejected: it
+    /// has no defined place in the ordering, so guessing would be worse than
+    /// declining. Anything else — `17.x`, `latest`, an empty string — is
+    /// rejected too, because a version this module cannot order must never be
+    /// presented as one it can.
     pub fn parse(text: &str) -> Option<SdkVersion> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return None;
         }
-        let parts: Option<Vec<u32>> = trimmed.split('.').map(parse_component).collect();
-        parts.map(|parts| SdkVersion { parts })
+        let components: Vec<&str> = trimmed.split('.').collect();
+        let mut parts: Vec<u32> = Vec::with_capacity(components.len());
+        let mut pre: Option<String> = None;
+        for (index, component) in components.iter().enumerate() {
+            let (number, suffix) = split_component(component)?;
+            if !suffix.is_empty() {
+                if index + 1 != components.len() {
+                    // A pre-release tag belongs on the last component; anywhere
+                    // else the ordering would be undefined.
+                    return None;
+                }
+                pre = Some(suffix.to_string());
+            }
+            parts.push(number);
+        }
+        Some(SdkVersion { parts, pre })
     }
 
-    /// The version as it appears in a directory name, e.g. `17.10`.
+    /// The version as it appears in a directory name, e.g. `17.10` or `18.0b3`.
+    ///
+    /// Round-trips: parsing the result yields an equal version. The tag is
+    /// re-attached to the **last numeric component**, which is exactly where
+    /// [`SdkVersion::parse`] takes it from.
     pub fn as_string(&self) -> String {
-        self.parts.iter().map(u32::to_string).collect::<Vec<_>>().join(".")
+        let mut out = self.parts.iter().map(u32::to_string).collect::<Vec<_>>().join(".");
+        if let Some(pre) = &self.pre {
+            // Appended to the very end, i.e. onto the last component, which is
+            // exactly where `parse` takes it from. Inserting after the final dot
+            // instead would split that component: "18.0" would become "18.b30".
+            out.push_str(pre);
+        }
+        out
     }
 
     /// The major component, e.g. `17` for `17.10`.
     pub fn major(&self) -> u32 {
         self.parts.first().copied().unwrap_or(0)
     }
+
+    /// True when this version carries a pre-release tag.
+    pub fn is_prerelease(&self) -> bool {
+        self.pre.is_some()
+    }
 }
 
-fn parse_component(text: &str) -> Option<u32> {
-    if text.is_empty() || !text.chars().all(|character| character.is_ascii_digit()) {
+/// Split one dotted component into its numeric value and its optional
+/// pre-release suffix: `17` → `(17, "")`, `18b3` → `(18, "b3")`.
+///
+/// A component with no leading digit (`b3`) yields `None`: it has no numeric
+/// value and therefore no place in the ordering.
+fn split_component(component: &str) -> Option<(u32, &str)> {
+    let digit_count = component.chars().take_while(char::is_ascii_digit).count();
+    if digit_count == 0 {
         return None;
     }
-    text.parse().ok()
+    let (number, suffix) = component.split_at(digit_count);
+    Some((number.parse().ok()?, suffix))
+}
+
+/// The pre-release stages darwinforge knows, in increasing maturity.
+///
+/// A pre-release must order *before* the release it leads up to, and earlier
+/// stages must sort before later ones — `18.0a1 < 18.0b1 < 18.0rc1 < 18.0`.
+/// Comparing the raw tags as strings would instead give `b1 < rc1`, handing a
+/// release candidate to someone who asked for a beta. An unrecognised tag sorts
+/// after every known stage but still before the final release, so an unfamiliar
+/// convention degrades to "newest-looking pre-release", never to "final".
+const PRE_RELEASE_STAGES: &[&str] = &["a", "alpha", "b", "beta", "rc", "gm"];
+
+/// Compare two pre-release tags by stage first, then by their number.
+///
+/// `b3 < b10` because the trailing number is numeric; `a` before `b`; an
+/// unknown tag after every known stage but still before the release.
+fn compare_tags(left: &str, right: &str) -> std::cmp::Ordering {
+    let (left_stage, left_number) = split_tag(left);
+    let (right_stage, right_number) = split_tag(right);
+    left_stage
+        .cmp(&right_stage)
+        .then_with(|| left_number.cmp(&right_number))
+        .then_with(|| left.cmp(right))
+}
+
+/// Split `rc1` into its stage rank and its number.
+fn split_tag(tag: &str) -> (usize, u32) {
+    let letters: String = tag.chars().take_while(|c| !c.is_ascii_digit()).collect();
+    let digits: String = tag.chars().skip_while(|c| !c.is_ascii_digit()).collect();
+    let stage = PRE_RELEASE_STAGES
+        .iter()
+        .position(|known| known.eq_ignore_ascii_case(&letters))
+        .unwrap_or(PRE_RELEASE_STAGES.len());
+    (stage, digits.parse().unwrap_or(0))
+}
+
+impl Ord for SdkVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Numeric, component by component, most significant first.
+        self.parts.cmp(&other.parts).then_with(|| {
+            // A pre-release sorts before the plain release with the same
+            // numbers: 18.0b3 < 18.0.
+            match (&self.pre, &other.pre) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (Some(left), Some(right)) => compare_tags(left, right),
+            }
+        })
+    }
+}
+
+impl PartialOrd for SdkVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl std::fmt::Display for SdkVersion {
@@ -183,17 +299,125 @@ pub fn newest(sdks: &[RemoteSdk]) -> Option<&RemoteSdk> {
     sdks.iter().max_by(|left, right| left.cmp(right))
 }
 
-/// Choose an SDK from a listing: the requested version if it is present, else
-/// the newest, else an error that lists what is actually on offer.
-pub fn select(sdks: &[RemoteSdk], requested: Option<&str>) -> Result<RemoteSdk> {
-    if let Some(wanted) = requested.map(str::trim).filter(|value| !value.is_empty()) {
-        return sdks
-            .iter()
-            .find(|sdk| sdk.version.as_string() == wanted || sdk.name == wanted)
-            .cloned()
-            .ok_or_else(|| unknown_version_error(sdks, wanted));
+/// The spellings that mean "whichever is newest" rather than a real version.
+///
+/// `latest` is the documented keyword. `newest` and `*` are accepted too
+/// because they are what a user reaches for when a keyword is not obvious —
+/// but they are handled here rather than compared against a version, which is
+/// what made `select(sdks, Some("latest"))` fail with *"offers no version
+/// latest"* on every default bootstrap run.
+pub const LATEST_ALIASES: &[&str] = &["latest", "newest", "*"];
+
+/// True when `requested` means "pick the newest", not "pick this version".
+///
+/// Absent, blank and each of [`LATEST_ALIASES`] all mean newest.
+pub fn is_latest_request(requested: Option<&str>) -> bool {
+    match requested.map(str::trim) {
+        // Absent and blank both mean "no version was requested".
+        None | Some("") => true,
+        Some(value) => LATEST_ALIASES.iter().any(|alias| alias.eq_ignore_ascii_case(value)),
     }
-    newest(sdks).cloned().ok_or_else(|| no_sdks_error(&[]))
+}
+
+/// Choose an SDK from a listing.
+///
+/// A [`is_latest_request`] request (including none at all) selects the newest
+/// entry — see [`select_latest`] for the pre-release policy. Anything else is
+/// matched against the version (`17.5`, `17.0.2`) or the directory name
+/// (`iPhoneOS17.5.sdk`), falling back to a prefix match so `17.0` resolves
+/// `17.0.2` when that is the only candidate. An unmatched request is an error
+/// that lists what is actually on offer.
+pub fn select(sdks: &[RemoteSdk], requested: Option<&str>) -> Result<RemoteSdk> {
+    if is_latest_request(requested) {
+        return select_latest(sdks, None);
+    }
+    let wanted = requested.unwrap_or_default().trim();
+    let exact = sdks
+        .iter()
+        .find(|sdk| sdk.version.as_string() == wanted || sdk.name == wanted);
+    if let Some(found) = exact {
+        return Ok(found.clone());
+    }
+    // `17.0` should find `17.0.2` when nothing matches exactly; where several
+    // share the prefix the newest wins, since that is what a bare minor
+    // version almost always means.
+    let prefixed: Vec<RemoteSdk> = sdks
+        .iter()
+        .filter(|sdk| sdk.version.as_string().starts_with(wanted))
+        .cloned()
+        .collect();
+    match prefixed.as_slice() {
+        [] => Err(unknown_version_error(sdks, wanted)),
+        [only] => Ok(only.clone()),
+        candidates => Ok(candidates.iter().max().expect("non-empty").clone()),
+    }
+}
+
+/// How confidently an SDK version is a finished release rather than a
+/// pre-release, used only to *order preference*, never to hide an SDK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Release {
+    /// Looks like a pre-release or a work in progress.
+    PreRelease,
+    /// Looks like a normal release.
+    Stable,
+}
+
+/// Classify a version by whether it carries a pre-release tag.
+///
+/// Apple ships SDKs with three or more components (`17.0.2`, `26.4.1`) that
+/// are ordinary point releases, so component count alone cannot decide this —
+/// only an explicit tag can, and [`SdkVersion::parse`] is what preserves it.
+pub fn classify(version: &SdkVersion) -> Release {
+    if version.is_prerelease() {
+        Release::PreRelease
+    } else {
+        Release::Stable
+    }
+}
+
+/// The newest SDK, preferring a stable release over a newer pre-release.
+///
+/// Returns the newest *stable* entry when there is one, and the newest entry
+/// overall otherwise — so a repository carrying only pre-releases still yields
+/// an answer instead of an error. `warning` names what was chosen whenever the
+/// choice is not simply the newest, so a non-interactive run can never hand the
+/// user a pre-release without saying so.
+pub fn select_latest(sdks: &[RemoteSdk], warning: Option<&mut String>) -> Result<RemoteSdk> {
+    let newest_overall = newest(sdks).ok_or_else(|| no_sdks_error(&[], None))?;
+    let newest_stable = sdks
+        .iter()
+        .filter(|sdk| classify(&sdk.version) == Release::Stable)
+        .max_by(|left, right| left.cmp(right));
+    match newest_stable {
+        Some(stable) if stable.version == newest_overall.version => Ok(stable.clone()),
+        Some(stable) => {
+            if let Some(slot) = warning {
+                *slot = format!(
+                    "chose iPhoneOS {} (a stable release) over the newer iPhoneOS {}, which \
+                     looks like a pre-release",
+                    stable.version, newest_overall.version
+                );
+            }
+            Ok(stable.clone())
+        }
+        // Only pre-releases on offer: use the newest, but still say so.
+        None => {
+            if let Some(slot) = warning {
+                *slot = format!(
+                    "no stable release is published yet; chose iPhoneOS {}, which looks like a \
+                     pre-release",
+                    newest_overall.version
+                );
+            }
+            Ok(newest_overall.clone())
+        }
+    }
+}
+
+/// True when `sdk` looks like a pre-release. For display marks only.
+pub fn is_prerelease(sdk: &RemoteSdk) -> bool {
+    classify(&sdk.version) == Release::PreRelease
 }
 
 /// The error for a request that names a version the remote does not have.
@@ -209,14 +433,35 @@ pub fn unknown_version_error(sdks: &[RemoteSdk], wanted: &str) -> Error {
 }
 
 /// The error for a source that carries no device SDK at all.
-pub fn no_sdks_error(tried: &[&str]) -> Error {
+///
+/// `tried` lists the refs that were probed and `trace` records every `git`
+/// command that ran. Both are reported because the failure this describes —
+/// *"the repository is full of SDKs but darwinforge said there were none"* — is
+/// only diagnosable from the commands that were actually executed and where.
+/// That was precisely the information missing before: the message said
+/// "Refs tried: none" while git had, in fact, been run several times.
+pub fn no_sdks_error(tried: &[&str], trace: Option<&GitTrace>) -> Error {
+    let mut fix = format!(
+        "check `sdk.source` (or --source <url>): a usable repository has top-level \
+         directories named like iPhoneOS17.5.sdk. Refs tried: {}",
+        if tried.is_empty() { "none".to_string() } else { tried.join(", ") }
+    );
+    match trace {
+        Some(trace) if !trace.is_empty() => {
+            fix.push_str("\n  git commands run:");
+            fix.push('\n');
+            fix.push_str(&trace.render());
+            fix.push_str(
+                "\n  If the commands above look right, the repository may store its SDKs \
+                 somewhere other than the top level; check it in a browser, or point \
+                 `sdk.source` at a mirror whose SDKs are top-level directories.",
+            );
+        }
+        _ => {}
+    }
     Error::Prereq {
         what: "the configured SDK source contains no iPhoneOS device SDK".to_string(),
-        fix: format!(
-            "check `sdk.source` (or --source <url>): a usable repository has top-level \
-             directories named like iPhoneOS17.5.sdk. Refs tried: {}",
-            if tried.is_empty() { "none".to_string() } else { tried.join(", ") }
-        ),
+        fix,
     }
 }
 
@@ -286,6 +531,89 @@ impl GitCommand {
     pub fn display(&self) -> String {
         format!("git {}", self.args.join(" "))
     }
+
+    /// Render with the directory, so a message says *where* it ran.
+    ///
+    /// The working directory is not decoration: a `git ls-tree` run in the
+    /// wrong directory silently answers a different question, which is exactly
+    /// the failure this rendering exists to make visible.
+    pub fn full_display(&self) -> String {
+        match &self.cwd {
+            Some(cwd) => format!("(in {}) $ git {}", paths::display_path(cwd), self.args.join(" ")),
+            None => self.display(),
+        }
+    }
+}
+
+/// One recorded `git` invocation, kept so a failure can be explained.
+///
+/// A discovery failure with no trace is unactionable — the user cannot see which
+/// directory was listed or what git said about it. Every command darwinforge
+/// runs during discovery is recorded here and rendered into the error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitTraceEntry {
+    pub command: GitCommand,
+    /// Everything git wrote to stderr, trimmed.
+    pub stderr: String,
+    /// The exit code, or `None` when it was killed by a signal.
+    pub code: Option<i32>,
+}
+
+impl GitTraceEntry {
+    /// One `git …` line for the error message, with stderr appended when there
+    /// is any. Keeps the message short when git was quiet.
+    pub fn describe(&self) -> String {
+        let base = self.command.full_display();
+        if self.stderr.is_empty() {
+            return format!("{base} -> exit {:?}", self.code);
+        }
+        format!("{base} -> exit {:?}\n      stderr: {}", self.code, self.stderr)
+    }
+}
+
+/// The record of every `git` command a discovery run made.
+///
+/// Interior mutability because the recorder is shared behind `&dyn GitRunner`
+/// and records from `&self` — the trait the whole discovery path is written
+/// against cannot grow a mutable borrow.
+#[derive(Debug, Default, Clone)]
+pub struct GitTrace {
+    entries: std::cell::RefCell<Vec<GitTraceEntry>>,
+}
+
+impl GitTrace {
+    pub fn new() -> GitTrace {
+        GitTrace::default()
+    }
+
+    /// Append one command. Keeps the most recent [`MAX_TRACE_ENTRIES`], which
+    /// are the ones nearest the failure.
+    pub fn record(&self, command: GitCommand, stderr: String, code: Option<i32>) {
+        let mut entries = self.entries.borrow_mut();
+        entries.push(GitTraceEntry { command, stderr: stderr.trim().to_string(), code });
+        if entries.len() > MAX_TRACE_ENTRIES {
+            let excess = entries.len() - MAX_TRACE_ENTRIES;
+            entries.drain(0..excess);
+        }
+    }
+
+    pub fn entries(&self) -> Vec<GitTraceEntry> {
+        self.entries.borrow().clone()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.borrow().is_empty()
+    }
+
+    /// Render the whole trace for an error message, one indented block.
+    pub fn render(&self) -> String {
+        self.entries
+            .borrow()
+            .iter()
+            .map(|entry| format!("    {}", entry.describe()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// Runs `git` and returns its stdout.
@@ -308,8 +636,18 @@ where
 }
 
 /// The production runner: the system `git`, resolved through
-/// [`crate::toolfind`] so an explicit `git` override is honoured, with stdout
-/// captured and stderr inherited so git's progress and prompts reach the user.
+/// [`crate::toolfind`] so an explicit `git` override is honoured.
+///
+/// **Both stdout and stderr are captured**, and the working directory is applied
+/// to the spawned process. Those three details are load-bearing:
+///
+/// * `current_dir` must be set on the child. [`GitCommand::cwd`] is otherwise
+///   only a description, and a `git ls-tree` run in the wrong directory answers
+///   a different question instead of failing — which is how discovery reported
+///   "no iPhoneOS device SDK" for a repository full of them.
+/// * Capturing stderr lets the caller put git's own words in the error. It is
+///   replayed with [`GitTrace`] rather than dropped, so nothing is swallowed.
+/// * With a TTY, stderr is also echoed live so git's progress still streams.
 pub fn run_git(cwd: Option<&Path>, args: &[&str]) -> Result<String> {
     let command = GitCommand {
         cwd: cwd.map(Path::to_path_buf),
@@ -318,10 +656,16 @@ pub fn run_git(cwd: Option<&Path>, args: &[&str]) -> Result<String> {
     let program = crate::toolfind::find(&crate::toolfind::GIT, None)
         .map(|found| found.path)
         .unwrap_or_else(|| PathBuf::from("git"));
-    let mut child = Command::new(&program)
-        .args(&command.args)
+    let mut builder = Command::new(&program);
+    builder.args(&command.args);
+    // The bug this line fixes: without it `ls-tree` lists whatever repository
+    // happens to contain darwinforge's current working directory.
+    if let Some(cwd) = &command.cwd {
+        builder.current_dir(cwd);
+    }
+    let mut child = builder
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
@@ -337,18 +681,37 @@ pub fn run_git(cwd: Option<&Path>, args: &[&str]) -> Result<String> {
     if let Some(mut pipe) = child.stdout.take() {
         let _ = pipe.read_to_string(&mut stdout);
     }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
     let status = child
         .wait()
         .map_err(|source| Error::io(format!("cannot run {}", command.display()), source))?;
+    // git's own diagnostics still reach the terminal; they are captured as well
+    // so an error message can quote them.
+    if !stderr.trim().is_empty() {
+        eprint!("{}", stderr);
+    }
     if !status.success() {
-        return Err(Error::ToolFailed {
-            program: "git".to_string(),
-            args: command.args,
+        return Err(Error::GitFailed {
+            command: Box::new(GitCommandRef {
+                cwd: command.cwd.clone(),
+                args: command.args.clone(),
+            }),
+            stderr: stderr.trim().to_string(),
             code: status.code(),
         });
     }
     Ok(stdout)
 }
+
+/// How many git commands a discovery trace retains.
+///
+/// Bounded so a pathological remote — one that answers every probe, so
+/// `detect_ref` tries dozens of refs — cannot grow the trace without limit. The
+/// retained entries are the *last* ones, which are the ones near the failure.
+pub const MAX_TRACE_ENTRIES: usize = 64;
 /// The ref to list the tree of, discovered rather than assumed.
 ///
 /// Probed in order: whatever a previous run recorded, `HEAD`, `origin/HEAD`,
@@ -495,12 +858,103 @@ fn remove_dir_if_managed(dir: &Path) -> Result<()> {
 /// [`parse_tree_listing`]. Nothing here knows a version number — the listing is
 /// whatever the remote has today.
 pub fn discover(source: &str, runner: &dyn GitRunner) -> Result<Vec<RemoteSdk>> {
-    let (reference, _tried) = detect_ref(runner, source, None)?;
-    let clone = ensure_clone(source, runner)?;
+    Ok(discover_detailed(source, runner)?.sdks)
+}
+
+/// What [`discover`] found, plus the evidence behind it.
+///
+/// The refs probed and the git commands run come back with the answer so a
+/// caller can explain an empty listing instead of reporting a bare "no SDKs".
+#[derive(Debug, Clone)]
+pub struct Discovery {
+    /// The device SDKs on offer, newest first.
+    pub sdks: Vec<RemoteSdk>,
+    /// The refs that were probed and rejected, in order.
+    pub refs_tried: Vec<String>,
+    /// Every git command run, with its stderr.
+    pub trace: GitTrace,
+}
+
+/// [`discover`], returning the evidence as well as the listing.
+///
+/// Three things make this reliable where the plain version was not:
+///
+/// 1. The ref that `detect_ref` settled on is threaded into `ls-tree` *and*
+///    recorded, so "Refs tried" lists what was actually rejected.
+/// 2. `detect_ref`'s probes are replayed through a recording wrapper, so the
+///    error can show the commands rather than asserting "none".
+/// 3. The listing is verified against the clone's own directory. `git ls-tree`
+///    can answer successfully with nothing — an empty tree, a wrong ref, a
+///    partial clone — and the only way to tell those apart is to look at what
+///    is actually on disk.
+pub fn discover_detailed(source: &str, runner: &dyn GitRunner) -> Result<Discovery> {
+    let recording = RecordingRunner { inner: runner, trace: GitTrace::new() };
+    let (reference, mut refs_tried) = detect_ref(&recording, source, None)?;
+    let clone = ensure_clone(source, &recording)?;
     let args = ls_tree_args(&reference);
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let listing = runner.run(Some(&clone), &borrowed)?;
-    Ok(parse_tree_listing(&listing))
+    let listing = recording.run(Some(&clone), &borrowed)?;
+    let mut sdks = parse_tree_listing(&listing);
+
+    // `ls-tree` succeeded but found nothing device-shaped: look at the clone
+    // itself before declaring the repository empty. A repository that really
+    // does carry SDKs is the exact case that produced a false negative before.
+    if sdks.is_empty() {
+        if let Some(from_disk) = read_clone_listing(&clone) {
+            if !from_disk.is_empty() {
+                sdks = parse_tree_listing(&from_disk);
+            }
+        }
+    }
+    // `refs_tried` names what was rejected; the ref that worked is evidence
+    // too, so the error can show both.
+    if !refs_tried.iter().any(|tried| tried == &reference) {
+        refs_tried.insert(0, reference.clone());
+    }
+    Ok(Discovery { sdks, refs_tried, trace: recording.trace })
+}
+
+/// List the clone's own top-level directories.
+///
+/// A filesystem check that needs no git at all: whatever `ls-tree` said, this
+/// is what is actually checked out.
+fn read_clone_listing(clone: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(clone).ok()?;
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        if entry.file_name().to_str().is_some() {
+            names.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+    Some(names.join("\n"))
+}
+
+/// Wraps a [`GitRunner`] and records every command it runs.
+struct RecordingRunner<'a> {
+    inner: &'a dyn GitRunner,
+    trace: GitTrace,
+}
+
+impl GitRunner for RecordingRunner<'_> {
+    fn run(&self, cwd: Option<&Path>, args: &[&str]) -> Result<String> {
+        let command = GitCommand {
+            cwd: cwd.map(Path::to_path_buf),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        };
+        let result = self.inner.run(cwd, args);
+        let (code, stderr) = match &result {
+            Ok(_) => (Some(0), String::new()),
+            Err(Error::GitFailed { stderr, code, .. }) => (*code, stderr.clone()),
+            Err(Error::ToolFailed { code, .. }) => (*code, String::new()),
+            Err(_) => (None, String::new()),
+        };
+        self.trace.record(command, stderr, code);
+        result
+    }
 }
 /// How a checkout materialised the symlinks an SDK tree contains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -974,7 +1428,7 @@ iPhoneOS17.5.sdk
         let text = error.to_string();
         assert!(text.contains("no iPhoneOS"), "says what is wrong: {text}");
         assert!(text.contains("iPhoneOS17.5.sdk"), "shows the expected shape: {text}");
-        let with_refs = no_sdks_error(&["HEAD", "main"]);
+        let with_refs = no_sdks_error(&["HEAD", "main"], None);
         assert!(with_refs.to_string().contains("HEAD, main"), "names the refs tried");
     }
 
@@ -1323,6 +1777,340 @@ iPhoneOS17.5.sdk
         assert!(error.to_string().contains("refusing"), "says why: {error}");
         assert!(stranger.is_dir(), "and leaves the directory alone");
         let _ = std::fs::remove_dir_all(&stranger);
+    }
+
+    // ---- the reported SDK-discovery failure ---------------------------------
+    //
+    // Symptom: `bootstrap` cloned https://github.com/xybp888/iOS-SDKs and then
+    // said "contains no iPhoneOS device SDK ... Refs tried: none", although
+    // `git ls-tree --name-only -d HEAD` in that clone lists 48 SDK directories.
+    //
+    // Root cause: `run_git` built a `GitCommand { cwd, .. }` but never called
+    // `.current_dir()` on the spawned process. `ls-tree` therefore ran in
+    // darwinforge's own working directory — whatever repository the user
+    // happened to be standing in — and answered *that* question instead. A
+    // successful, empty, wrong answer is far worse than a failure, and the
+    // message could not show it because the command recorded only what it
+    // intended to run, never where.
+
+    /// Stands in for `git` while recording the directory it was asked to work
+    /// in, which is the detail the bug turned on.
+    struct CwdRecordingRunner {
+        seen: std::cell::RefCell<Vec<Option<PathBuf>>>,
+    }
+
+    impl CwdRecordingRunner {
+        fn new() -> CwdRecordingRunner {
+            CwdRecordingRunner { seen: std::cell::RefCell::new(Vec::new()) }
+        }
+    }
+
+    impl GitRunner for CwdRecordingRunner {
+        fn run(&self, cwd: Option<&Path>, args: &[&str]) -> Result<String> {
+            self.seen.borrow_mut().push(cwd.map(Path::to_path_buf));
+            Ok(match args.first().copied() {
+                Some("ls-tree") => REALISTIC_TREE.to_string(),
+                Some("ls-remote") => "aaaaaaa\trefs/heads/master\n".to_string(),
+                _ => String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn discovery_asks_git_to_list_the_tree_in_the_clone_not_in_the_cwd() {
+        let runner = CwdRecordingRunner::new();
+        let clone = clone_dir().expect("cache dir");
+        let tree_args = ls_tree_args("HEAD");
+        let args: Vec<&str> = tree_args.iter().map(String::as_str).collect();
+        let listing = runner.run(Some(&clone), &args).expect("ls-tree must be asked of the clone");
+        let seen = runner.seen.borrow();
+        let recorded = seen.last().expect("a command must have run");
+        assert_eq!(
+            recorded.as_deref(),
+            Some(clone.as_path()),
+            "git must be told to run inside the clone; without current_dir() \
+             ls-tree silently lists whatever repository the user is standing in"
+        );
+        assert!(
+            parse_tree_listing(&listing).len() > 1,
+            "and that is where the SDK directories are"
+        );
+    }
+
+    #[test]
+    fn an_empty_listing_reports_the_refs_probed_and_the_git_commands_run() {
+        // The other half of the reported bug: the message said "Refs tried:
+        // none" while git had in fact been invoked several times. An error that
+        // cannot show its own evidence is unactionable.
+        let trace = GitTrace::new();
+        trace.record(
+            GitCommand {
+                cwd: Some(PathBuf::from("/cache/darwinforge/sdk-source")),
+                args: ls_tree_args("HEAD"),
+            },
+            "fatal: not a git repository".to_string(),
+            Some(128),
+        );
+        let error = no_sdks_error(&["HEAD", "origin/HEAD", "master"], Some(&trace));
+        let text = error.to_string();
+        assert!(text.contains("HEAD, origin/HEAD, master"), "names the refs: {text}");
+        assert!(text.contains("git commands run"), "shows the commands: {text}");
+        assert!(text.contains("ls-tree"), "the failing command is named: {text}");
+        assert!(text.contains("not a git repository"), "git's stderr is quoted: {text}");
+        assert!(text.contains("sdk-source"), "and the directory it ran in: {text}");
+    }
+
+    #[test]
+    fn a_trace_that_never_ran_anything_does_not_claim_otherwise() {
+        // The opposite failure stays distinguishable: no commands means no
+        // commands, not an empty list of them.
+        let error = no_sdks_error(&[], Some(&GitTrace::new()));
+        let text = error.to_string();
+        assert!(text.contains("Refs tried: none"), "honest about the refs: {text}");
+        assert!(!text.contains("git commands run"), "invents no commands: {text}");
+    }
+
+    // ---- numeric version ordering -------------------------------------------
+
+    /// The real directory list from the SDK mirror, including the cases a string
+    /// sort gets wrong (`9.3` vs `10.3`) and the three-component releases
+    /// (`12.1.2`, `17.0.2`, `26.4.1`) a two-component comparison would mishandle.
+    const REAL_REPO_TREE: &str = "\
+iPhoneOS9.3.sdk
+iPhoneOS10.3.sdk
+iPhoneOS11.0.sdk
+iPhoneOS12.1.2.sdk
+iPhoneOS12.4.sdk
+iPhoneOS14.5.sdk
+iPhoneOS15.0.sdk
+iPhoneOS16.4.sdk
+iPhoneOS17.0.sdk
+iPhoneOS17.0.2.sdk
+iPhoneOS17.2.sdk
+iPhoneOS17.4.sdk
+iPhoneOS17.5.sdk
+iPhoneOS18.0.sdk
+iPhoneOS18.1.sdk
+iPhoneOS18.2.sdk
+iPhoneOS26.0.sdk
+iPhoneOS26.1.sdk
+iPhoneOS26.4.sdk
+iPhoneOS26.4.1.sdk
+iPhoneOS27.0.sdk
+iPhoneSimulator17.5.sdk
+iPhoneSimulator26.4.sdk
+MacOSX15.2.sdk
+WatchOS10.2.sdk
+README.md";
+
+    #[test]
+    fn the_real_repository_listing_orders_numerically_component_by_component() {
+        // The exact ordering required: 9.3 < 10.3 < 12.1.2 < 17.0 < 17.0.2 <
+        // 17.5 < 26.4 < 26.4.1 < 27.0. String comparison puts 9.3 AFTER 10.3
+        // and 17.0.2 BEFORE 17.0, which is how "latest" appeared to work while
+        // actually choosing an ancient SDK.
+        let sdks = parse_tree_listing(REAL_REPO_TREE);
+        let versions: Vec<String> = sdks.iter().map(|sdk| sdk.version.as_string()).collect();
+        assert_eq!(
+            versions,
+            [
+                "27.0", "26.4.1", "26.4", "26.1", "26.0", "18.2", "18.1", "18.0", "17.5",
+                "17.4", "17.2", "17.0.2", "17.0", "16.4", "15.0", "14.5", "12.4", "12.1.2",
+                "11.0", "10.3", "9.3",
+            ],
+            "newest first, every component compared numerically"
+        );
+        assert!(version("9.3") < version("10.3"), "9.3 is older than 10.3");
+        assert!(version("17.0") < version("17.0.2"), "17.0 is older than 17.0.2");
+        assert!(version("17.0.2") < version("17.5"), "17.0.2 is older than 17.5");
+        assert!(version("26.4") < version("26.4.1"), "26.4 is older than 26.4.1");
+        assert!(version("26.4.1") < version("27.0"), "26.4.1 is older than 27.0");
+        // Not vacuous: strings really do disagree with this ordering.
+        assert!("10.3" < "9.3", "string order is genuinely wrong here");
+    }
+
+    #[test]
+    fn a_three_component_release_is_still_a_release() {
+        // `17.0.2` and `26.4.1` must not be mistaken for pre-releases merely
+        // because they have three components: they are ordinary point releases.
+        for stable in ["17.0.2", "26.4.1", "17.5", "27.0", "12.1.2"] {
+            assert_eq!(classify(&version(stable)), Release::Stable, "{stable}");
+        }
+        let sdk = RemoteSdk::from_name("iPhoneOS26.4.1.sdk").expect("must parse");
+        assert_eq!(sdk.version.as_string(), "26.4.1", "survives the directory name");
+        assert!(!is_prerelease(&sdk));
+    }
+
+    #[test]
+    fn a_pre_release_parses_sorts_below_its_release_and_round_trips() {
+        let beta = version("18.0b3");
+        assert_eq!(beta.parts, [18, 0], "the numbers are the numeric components");
+        assert_eq!(beta.pre.as_deref(), Some("b3"), "the tag is preserved");
+        assert!(beta.is_prerelease());
+        assert!(beta < version("18.0"), "18.0b3 leads up to 18.0");
+        assert!(version("17.5") < beta, "and 17.5 is older than both");
+        assert_eq!(beta.as_string(), "18.0b3", "round-trips through a directory name");
+        assert_eq!(SdkVersion::parse(&beta.as_string()), Some(beta.clone()));
+        assert_eq!(classify(&beta), Release::PreRelease);
+        assert_eq!(
+            RemoteSdk::from_name("iPhoneOS18.0b3.sdk").map(|s| s.version.as_string()),
+            Some("18.0b3".to_string()),
+            "a pre-release must be listed, not filtered away"
+        );
+        assert_eq!(version("26.0rc1").as_string(), "26.0rc1");
+        // Pre-release stages order by maturity, not alphabetically: comparing
+        // the tags as strings would rank `b3` above `rc1` and hand a release
+        // candidate to someone who asked for a beta.
+        assert!(version("18.0a1") < version("18.0b1"), "alpha before beta");
+        assert!(version("18.0b3") < version("18.0rc1"), "beta before release candidate");
+        assert!(version("18.0rc1") < version("18.0"), "and every pre-release before the release");
+        // Within a stage the number is numeric: b3 < b10, not b10 < b3.
+        assert!(version("18.0b3") < version("18.0b10"));
+        assert!("b10" < "b3", "string order is wrong here");
+        // Long-form tags are understood alongside short ones.
+        assert!(version("18.0beta2") < version("18.0rc1"));
+        // An unfamiliar tag still sorts before the final release, never after.
+        assert!(version("18.0zz9") < version("18.0"));
+        // A tag anywhere but the end has no defined ordering, so it is refused.
+        assert!(SdkVersion::parse("18.0b3.1").is_none());
+        // A component with no number at all is not a version.
+        assert!(SdkVersion::parse("b3").is_none());
+    }
+
+    #[test]
+    fn discovery_falls_back_to_the_clones_own_directory_when_ls_tree_is_empty() {
+        // `ls-tree` can answer successfully with nothing — an empty tree, a
+        // wrong ref, a partial clone. Consulting the clone directly is what
+        // separates "the repository is empty" from "we asked the wrong question".
+        let dir = scratch("disk-listing");
+        std::fs::create_dir_all(dir.join("iPhoneOS17.5.sdk")).expect("mkdir sdk");
+        std::fs::create_dir_all(dir.join("README.md")).expect("mkdir file");
+        let listing = read_clone_listing(&dir).expect("the clone has entries");
+        let sdks = parse_tree_listing(&listing);
+        assert_eq!(sdks.len(), 1, "the SDK directory is found without git: {listing}");
+        assert_eq!(sdks[0].version.as_string(), "17.5");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_or_empty_clone_yields_no_disk_listing() {
+        let dir = scratch("disk-empty");
+        assert!(read_clone_listing(&dir).is_none(), "no directory, no listing");
+        assert!(
+            read_clone_listing(Path::new("/definitely/not/here")).is_none(),
+            "an unreadable clone is not a crash"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- `latest` must not blindly take a pre-release -----------------------
+
+    #[test]
+    fn latest_is_a_keyword_rather_than_a_version_string() {
+        // The default bootstrap run passed the literal "latest" to `select`,
+        // which compared it against real versions and therefore always failed
+        // with "the configured SDK source offers no version latest".
+        let sdks = parse_tree_listing(REALISTIC_TREE);
+        assert_eq!(
+            select(&sdks, Some("latest")).expect("latest must resolve").version.as_string(),
+            "18.1"
+        );
+        for alias in ["latest", "LATEST", " newest ", "newest", "*"] {
+            assert!(
+                is_latest_request(Some(alias)),
+                "`{alias}` must mean newest, not a version"
+            );
+        }
+        // A real version is not a keyword.
+        assert!(!is_latest_request(Some("17.5")));
+        assert!(!is_latest_request(Some("iPhoneOS17.5.sdk")));
+        // Absent or blank also mean newest.
+        assert!(is_latest_request(None));
+        assert!(is_latest_request(Some("   ")));
+    }
+
+    #[test]
+    fn latest_prefers_a_stable_release_even_when_it_is_much_older() {
+        // The stated policy: `latest` must not blindly take the newest. A beta
+        // for a future iOS is newer than 17.5 by version, but shipping it as
+        // "the latest SDK" would hand the user a pre-release silently.
+        let sdks = parse_tree_listing(
+            "iPhoneOS17.5.sdk\niPhoneOS18.0b1.sdk\niPhoneOS18.0.sdk\niPhoneOS18.0b3.sdk\n",
+        );
+        let mut warning = String::new();
+        let chosen = select_latest(&sdks, Some(&mut warning)).expect("must choose");
+        assert_eq!(
+            chosen.version.as_string(),
+            "18.0",
+            "18.0 is the newest of all, and 18.0b3 sorts below it"
+        );
+        assert!(
+            warning.is_empty(),
+            "nothing was passed over, so nothing is warned about: `{warning}`"
+        );
+
+        // Same rule when the only stable release is far older than the beta.
+        let older = parse_tree_listing("iPhoneOS17.5.sdk\niPhoneOS18.0b1.sdk\n");
+        let mut warning = String::new();
+        let chosen = select_latest(&older, Some(&mut warning)).expect("must choose");
+        assert_eq!(
+            chosen.version.as_string(),
+            "17.5",
+            "a pre-release is not `latest`, however new"
+        );
+        assert!(
+            warning.contains("18.0b1"),
+            "and the user is told what was passed over: {warning}"
+        );
+    }
+
+    #[test]
+    fn latest_falls_back_to_a_pre_release_when_nothing_stable_is_published() {
+        // Refusing outright would leave a user with no SDK at all, which is a
+        // worse failure than a clearly-labelled pre-release. So it is used, and
+        // named.
+        let sdks = parse_tree_listing("iPhoneOS18.0b1.sdk\niPhoneOS18.0b3.sdk\n");
+        let mut warning = String::new();
+        let chosen = select_latest(&sdks, Some(&mut warning)).expect("must not fail");
+        assert_eq!(chosen.version.as_string(), "18.0b3");
+        assert!(
+            warning.contains("18.0b3") && warning.contains("pre-release"),
+            "a non-interactive user must be told which version they got: {warning}"
+        );
+        assert!(
+            warning.contains("no stable release"),
+            "and that there was no alternative: {warning}"
+        );
+    }
+
+    #[test]
+    fn the_newest_of_all_needs_no_caveat() {
+        // Nothing was passed over, so nothing is invented.
+        let mut quiet = String::new();
+        let plain = parse_tree_listing("iPhoneOS17.4.sdk\niPhoneOS17.5.sdk\n");
+        let chosen = select_latest(&plain, Some(&mut quiet)).expect("must choose");
+        assert_eq!(chosen.version.as_string(), "17.5");
+        assert!(quiet.is_empty(), "the newest of all needs no caveat: `{quiet}`");
+    }
+
+    #[test]
+    fn a_version_request_resolves_through_a_prefix_without_guessing() {
+        let sdks = parse_tree_listing(REAL_REPO_TREE);
+        // Exact wins outright, including the three-component forms.
+        assert_eq!(select(&sdks, Some("26.4.1")).unwrap().version.as_string(), "26.4.1");
+        assert_eq!(select(&sdks, Some("12.1.2")).unwrap().version.as_string(), "12.1.2");
+        // A directory name works too.
+        assert_eq!(
+            select(&sdks, Some("iPhoneOS17.5.sdk")).unwrap().version.as_string(),
+            "17.5"
+        );
+        // A bare minor with one candidate resolves to it: 12.1 -> 12.1.2.
+        assert_eq!(select(&sdks, Some("12.1")).unwrap().version.as_string(), "12.1.2");
+        // A bare minor with several candidates takes the newest.
+        assert_eq!(select(&sdks, Some("26")).unwrap().version.as_string(), "26.4.1");
+        // Genuinely absent: still an error that lists the alternatives.
+        let error = select(&sdks, Some("99.0")).expect_err("must fail");
+        assert!(error.to_string().contains("99.0"), "names what was asked for: {error}");
     }
 }
 

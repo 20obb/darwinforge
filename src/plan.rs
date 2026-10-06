@@ -51,6 +51,14 @@ pub struct Step {
     pub status: Status,
     /// Set when the status is anything but a plain check.
     pub detail: Option<String>,
+    /// Whether the machine can build without this.
+    ///
+    /// This is what separates `zip` being absent from `clang` being absent.
+    /// A missing optional tool is a **[skipped]** note with a reason, never a
+    /// failure, and it must never count towards the outstanding total — a
+    /// Windows box with no `zip` still builds fine through the built-in writer,
+    /// so reporting it as a failure made a working machine exit 5.
+    pub optional: bool,
 }
 
 impl Step {
@@ -63,7 +71,17 @@ impl Step {
             commands: Vec::new(),
             status: Status::Ok,
             detail: None,
+            optional: false,
         }
+    }
+
+    /// Mark this step as something the machine can do without.
+    ///
+    /// An optional step that could not be satisfied is reported, but does not
+    /// make the plan incomplete.
+    pub fn optional(mut self) -> Step {
+        self.optional = true;
+        self
     }
 
     /// A step that will run `commands`.
@@ -79,6 +97,7 @@ impl Step {
             commands,
             status: Status::Ok,
             detail: None,
+            optional: false,
         }
     }
 
@@ -151,24 +170,59 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Steps that did not succeed.
+    /// Steps that did not succeed **and that matter**.
+    ///
+    /// An optional step is excluded. `zip` and `swiftc` improve a build but are
+    /// not required for one, so a machine missing them is not an unfinished
+    /// machine — counting them made a perfectly capable Windows host report
+    /// "the environment is NOT ready" and exit 5.
     pub fn incomplete(&self) -> Vec<&Step> {
         self.steps
             .iter()
+            .filter(|step| !step.optional)
             .filter(|step| matches!(step.status, Status::Failed | Status::Skipped))
             .collect()
     }
 
-    /// True when nothing is missing, so exit code 0 is honest.
-///
-/// A step that merely carries an install command is **not** complete: the
-/// machine still lacks the tool. Only `Ok` (present) and `Installed` (just
-/// installed) mean the requirement is satisfied, so a dry run can never report
-/// success for work it did not do.
-pub fn is_complete(&self) -> bool {
+    /// Optional steps that could not be satisfied, for reporting.
+    ///
+    /// These are shown so the user knows what was passed up, but never counted
+    /// as outstanding work.
+    pub fn skipped_optional(&self) -> Vec<&Step> {
         self.steps
             .iter()
+            .filter(|step| step.optional)
+            .filter(|step| !matches!(step.status, Status::Ok | Status::Installed))
+            .collect()
+    }
+
+    /// True when nothing *required* is missing, so exit code 0 is honest.
+    ///
+    /// A step that merely carries an install command is **not** complete: the
+    /// machine still lacks the tool. Only `Ok` (present) and `Installed` (just
+    /// installed) mean the requirement is satisfied, so a dry run can never report
+    /// success for work it did not do.
+    pub fn is_complete(&self) -> bool {
+        self.steps
+            .iter()
+            .filter(|step| !step.optional)
             .all(|step| matches!(step.status, Status::Ok | Status::Installed))
+    }
+
+    /// How many *required* items the real run would still have to install.
+    ///
+    /// The number `--dry-run` reports, computed from the plan rather than
+    /// counted by hand at the call site, so the message cannot drift from the
+    /// work actually described.
+    pub fn pending_count(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| !step.optional)
+            .filter(|step| {
+                matches!(step.status, Status::Failed | Status::Skipped)
+                    || !step.commands.is_empty()
+            })
+            .count()
     }
 
     /// True when a step carries a command that the real run would execute.
@@ -209,13 +263,21 @@ pub fn is_complete(&self) -> bool {
 /// The repository is probed before the package name is used, so we never print
 /// an install command for a package the archive does not carry. `available` is
 /// the injected probe result, which keeps this function pure and testable.
-pub fn plan_package_install(
+///
+/// `required` decides what happens when the tool cannot be installed. For an
+/// **optional** tool that is a `[skipped]` note explaining why it is not needed,
+/// never a `[failed]` — see [`Step::optional`]. `optional_detail` supplies the
+/// sentence shown for that case, e.g. "the built-in zip writer will be used".
+#[allow(clippy::too_many_arguments)]
+pub fn plan_package_install_with(
     tool: &str,
     manager: PackageManager,
     package: Option<&str>,
     available: bool,
+    required: bool,
+    optional_detail: Option<&str>,
 ) -> Step {
-    match (package, available) {
+    let step = match (package, available) {
         (Some(package), true) => {
             let arguments: Vec<String> = vec![package.to_string()];
             let args = manager.install_args(&arguments);
@@ -228,7 +290,7 @@ pub fn plan_package_install(
         }
         (Some(package), false) => Step::check(tool, format!("install `{package}`"))
             .with_outcome(
-                Status::Failed,
+                if required { Status::Failed } else { Status::Skipped },
                 format!(
                     "`{package}` is not available in the configured {} repositories; \
                      refresh the package index and retry, or install it manually \
@@ -244,9 +306,31 @@ pub fn plan_package_install(
                 ),
                 _ => format!("no package for {tool} on {}", manager.label()),
             };
-            Step::check(tool, format!("install {tool}")).with_outcome(Status::Failed, reason)
+            // "no package for zip on winget" is a fact about an optional tool,
+            // not a failure: the built-in writer covers it.
+            let detail = match (required, optional_detail) {
+                (false, Some(explanation)) => format!("{reason}; {explanation}"),
+                _ => reason,
+            };
+            Step::check(tool, format!("install {tool}"))
+                .with_outcome(if required { Status::Failed } else { Status::Skipped }, detail)
         }
+    };
+    if required {
+        step
+    } else {
+        step.optional()
     }
+}
+
+/// [`plan_package_install_with`] for a tool the build cannot proceed without.
+pub fn plan_package_install(
+    tool: &str,
+    manager: PackageManager,
+    package: Option<&str>,
+    available: bool,
+) -> Step {
+    plan_package_install_with(tool, manager, package, available, true, None)
 }
 
 /// The step that explains why a tool is missing entirely.
@@ -260,26 +344,56 @@ pub fn plan_unbuildable(tool: &str, detail: &str) -> Step {
 /// Build the plan of package installs implied by a host's missing tools.
 ///
 /// Pure: takes the already-probed facts and returns the steps, so the same
-/// function backs both `--dry-run` and the real run.
+/// function backs both `--dry-run` and the real run. `missing` carries each
+/// tool's `(name, package, available, required)` tuple, so optionality decided
+/// at the call site is preserved all the way to the report.
 pub fn plan_tool_installs(
     manager: Option<PackageManager>,
-    missing: &[(&str, Option<&str>, bool)],
+    missing: &[(&str, Option<&str>, bool, bool)],
 ) -> Plan {
     let steps = missing
         .iter()
-        .map(|(tool, package, available)| match manager {
-            Some(manager) => plan_package_install(tool, manager, *package, *available),
-            None => plan_unbuildable(
-                tool,
-                &format!(
-                    "no supported package manager was found; install {tool} manually \
-                     and re-run, or re-run on a system with apt/dnf/pacman/zypper/apk/\
-                     brew/winget/choco/scoop"
-                ),
-            ),
+        .map(|(tool, package, available, required)| {
+            let name: &str = tool;
+            let detail = if *required { None } else { Some(optional_reason(name)) };
+            match manager {
+                Some(manager) => {
+                    plan_package_install_with(tool, manager, *package, *available, *required, detail)
+                }
+                None => {
+                    let message = format!(
+                        "no supported package manager was found; install {name} manually \
+                         and re-run, or re-run on a system with apt/dnf/pacman/zypper/apk/\
+                         brew/winget/choco/scoop"
+                    );
+                    let step = Step::check(name, format!("obtain {name}")).with_outcome(
+                        if *required { Status::Failed } else { Status::Skipped },
+                        message,
+                    );
+                    if *required {
+                        step
+                    } else {
+                        step.optional()
+                    }
+                }
+            }
         })
         .collect();
     Plan { steps }
+}
+
+/// Why an optional tool is not needed, in one clause.
+///
+/// The reason must say what happens *instead*, so a `[skipped]` line reads as a
+/// decision rather than a shortfall.
+fn optional_reason(tool: &str) -> &'static str {
+    match tool {
+        "zip" => "the built-in zip writer is used instead, so builds are unaffected",
+        "swiftc" => "Swift sources will be rejected with a clear error; C/ObjC/C++ is unaffected",
+        "git" => "needed only to fetch an SDK; a build with a local SDK is unaffected",
+        "ld" => "ld64.lld is preferred and is what the build uses",
+        _ => "the build does not need it",
+    }
 }
 
 #[cfg(test)]
@@ -439,7 +553,7 @@ mod tests {
 
     #[test]
     fn no_package_manager_yields_an_actionable_failure() {
-        let plan = plan_tool_installs(None, &[("clang", None, false)]);
+        let plan = plan_tool_installs(None, &[("clang", None, false, true)]);
         assert!(!plan.is_complete());
         let detail = plan.steps[0].detail.clone().expect("must explain");
         assert!(detail.contains("package manager"), "{detail}");
@@ -455,11 +569,11 @@ mod tests {
             let manager = crate::distro::manager_for_distro(&release);
             assert_eq!(manager, Some(*expected), "{name} must resolve to {}", expected.label());
 
-            let missing: Vec<(&str, Option<&str>, bool)> = vec![
-                ("clang", Some("clang"), true),
-                ("ld64.lld", Some("lld"), true),
+            let missing: Vec<(&str, Option<&str>, bool, bool)> = vec![
+                ("clang", Some("clang"), true, true),
+                ("ld64.lld", Some("lld"), true, true),
                 // No package row for this manager: must be a source build.
-                ("ldid", None, false),
+                ("ldid", None, false, true),
             ];
             let plan = plan_tool_installs(manager, &missing);
             let rendered = plan.render(true);

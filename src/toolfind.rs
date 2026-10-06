@@ -628,7 +628,11 @@ pub fn detect_version(binary: &Path, probe: VersionProbe<'_>) -> Option<String> 
 }
 
 /// The production version probe: `<binary> --version`, first line, tolerantly.
-/// A binary that is missing or refuses to be run yields `None`.
+///
+/// [`crate::exec::probe`] returns `Option<Option<String>>` — `Ok(None)` for a
+/// missing binary, `Ok(Some(text))` for one that printed nothing. This flattens
+/// that so a caller asking for a version gets `None` in both cases rather than
+/// having to unwrap twice.
 pub fn probe_version(binary: &Path) -> Option<String> {
     let program = paths::display_path(binary);
     exec::probe(&program, &["--version".to_string()]).ok().flatten()

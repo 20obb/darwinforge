@@ -1,4 +1,4 @@
-# Maintainer: DarwinForge contributors <darwinforge@example.invalid>
+# Maintainer: 20obb <20obb@users.noreply.github.com>
 
 # SC2034/SC2154: pkgname/pkgver/pkgrel/pkgdesc/arch/... look unused or
 # unassigned to shellcheck, but they are not shell variables: makepkg sources
@@ -10,7 +10,7 @@ pkgver=0.0.0
 pkgrel=1
 pkgdesc='Build an installable iOS .ipa on Linux, without a Mac'
 arch=('x86_64' 'aarch64')
-url='https://github.com/darwinforge/darwinforge'
+url='https://github.com/20obb/darwinforge'
 license=('MIT')
 
 # git is required (projects are usually cloned); clang/lld/zip are what

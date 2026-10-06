@@ -27,8 +27,8 @@ Release:        1%{?dist}
 Summary:        Build an installable iOS .ipa on Linux, without a Mac
 
 License:        MIT
-URL:            https://github.com/darwinforge/darwinforge
-Source0:        https://github.com/darwinforge/darwinforge/archive/v%{version}.tar.gz
+URL:            https://github.com/20obb/darwinforge
+Source0:        https://github.com/20obb/darwinforge/archive/v%{version}.tar.gz
 
 # git is required because projects are usually cloned; clang/lld/zip are what
 # darwinforge itself shells out to and are recommended, not required, so a
@@ -88,5 +88,5 @@ CARGO_NET_OFFLINE=true cargo test --offline --locked
 %{_bindir}/darwinforge
 
 %changelog
-* Thu Jan 01 2026 DarwinForge contributors <darwinforge@example.invalid> - 0.1.0-1
+* Thu Jan 01 2026 20obb <20obb@users.noreply.github.com> - 0.1.0-1
 - Initial packaging. Version injected from Cargo.toml at build time.
